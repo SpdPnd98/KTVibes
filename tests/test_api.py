@@ -19,7 +19,8 @@ class APITests(unittest.TestCase):
         async def idle_worker(*args):
             await asyncio.Event().wait()
         self.patches = [patch.object(main, 'state', State()), patch.object(main, 'CACHE', Path(self.temp.name)),
-                        patch.object(main.worker, 'run', idle_worker)]
+                        patch.object(main.worker, 'run', idle_worker), patch.object(main.curator, 'run', idle_worker),
+                        patch.object(main, 'import_root', return_value=None)]
         for item in self.patches:
             item.start()
         self.client_context = TestClient(main.app)
@@ -111,6 +112,46 @@ class APITests(unittest.TestCase):
         self.main.state.played = {'aaaaaaaaaaa': 5.0}
         songs = {s['id']: s for s in self.client.get('/api/songbook').json()}
         self.assertEqual((songs['aaaaaaaaaaa']['played'], songs['bbbbbbbbbbb']['played']), (5.0, None))
+
+    def test_owner_import_review_and_prepare_persist(self):
+        csv = 'artist,title,language,source_id\nIU,Good Day,ko,abcdefghijk\n'
+        imported = self.client.post('/api/owner/import', json={'content': csv})
+        self.assertEqual(imported.json()['imported'], 1)
+        candidate = self.client.get('/api/owner/candidates', params={'status': 'pending'}).json()[0]
+        reviewed = self.client.post('/api/owner/candidates/review', json={'ids': [candidate['id']], 'status': 'approved'})
+        self.assertEqual(reviewed.json()['changed'], 1)
+        queued = self.client.post('/api/owner/jobs', json={'ids': [candidate['id']]})
+        self.assertEqual((queued.status_code, queued.json()['queued']), (201, 1))
+        jobs = self.client.get('/api/owner/jobs').json()
+        self.assertEqual((jobs[0]['status'], jobs[0]['external_id']), ('queued', 'abcdefghijk'))
+
+    def test_owner_renderer_requires_private_literal_ip(self):
+        bad = self.client.post('/api/owner/renderers', json={'name': 'Bad', 'url': 'http://example.com:8790'})
+        self.assertEqual(bad.status_code, 422)
+        saved = self.client.post('/api/owner/renderers', json={'name': 'GPU', 'url': 'http://192.168.1.42:8790'})
+        self.assertEqual(saved.status_code, 201)
+        selected = self.client.post('/api/owner/renderers/select', json={'id': saved.json()['id']})
+        self.assertEqual(selected.status_code, 200)
+        renderers = self.client.get('/api/owner/renderers').json()
+        self.assertEqual(next(item for item in renderers if item['selected'])['name'], 'GPU')
+
+    def test_owner_token_protects_owner_apis(self):
+        with patch.dict('os.environ', {'KTVIBES_OWNER_TOKEN': 'secret'}):
+            self.assertEqual(self.client.get('/api/owner/candidates').status_code, 401)
+            response = self.client.get('/api/owner/candidates', headers={'X-KTVibes-Owner-Token': 'secret'})
+            self.assertEqual(response.status_code, 200)
+
+    def test_owner_scans_configured_shared_m4a_folder(self):
+        incoming = Path(self.temp.name) / 'incoming'
+        incoming.mkdir()
+        (incoming / 'IU - Good Day.m4a').write_bytes(b'm4a-source')
+        self.main.catalog.import_root = incoming.resolve()
+        status = self.client.get('/api/owner/import-folder').json()
+        self.assertEqual((status['configured'], status['available']), (True, True))
+        scanned = self.client.post('/api/owner/import-folder')
+        self.assertEqual((scanned.status_code, scanned.json()['imported']), (201, 1))
+        candidate = self.client.get('/api/owner/candidates').json()[0]
+        self.assertEqual((candidate['provider'], candidate['source_path']), ('local', 'IU - Good Day.m4a'))
 
     def test_delete_song_removes_download_and_history(self):
         import json
@@ -271,7 +312,7 @@ class APITests(unittest.TestCase):
         opened.assert_called_once_with(f'http://127.0.0.1:{self.main.PORT}')
 
     def test_unicode_input_validation_and_static_pages(self):
-        for route in ('/', '/tv', '/remote', '/static/tv.js', '/api/qr.svg'):
+        for route in ('/', '/tv', '/remote', '/owner', '/static/tv.js', '/static/owner.js', '/api/qr.svg'):
             self.assertEqual(self.client.get(route).status_code, 200)
         song = {'id': 'abcdefghijk', 'artist': '周杰倫', 'title': '晴天 / 좋은 날'}
         response = self.client.post('/api/queue', json=song)
@@ -359,6 +400,46 @@ class APITests(unittest.TestCase):
             self.assertEqual(self.client.get('/api/search', params={'q': '晴天', 'page': 2}).status_code, 200)
             search.assert_called_once_with('晴天', 2)
             self.assertEqual(self.client.get('/api/search', params={'q': 'x', 'page': 10}).status_code, 422)
+
+
+@unittest.skipUnless(AVAILABLE, 'Run uv sync to install API test dependencies')
+class RendererAgentTests(unittest.TestCase):
+    def setUp(self):
+        from fastapi.testclient import TestClient
+        from ktvibes import render_agent
+        self.agent = render_agent
+        self.temp = tempfile.TemporaryDirectory()
+        self.patches = [patch.object(render_agent, 'ROOT', Path(self.temp.name)),
+                        patch.dict('os.environ', {'KTVIBES_RENDERER_TOKEN': 'secret'})]
+        for item in self.patches:
+            item.start()
+        self.context = TestClient(render_agent.app)
+        self.client = self.context.__enter__()
+        self.headers = {'X-KTVibes-Renderer-Token': 'secret', 'X-KTVibes-Job-Key': 'source-key'}
+
+    def tearDown(self):
+        self.context.__exit__(None, None, None)
+        for item in reversed(self.patches):
+            item.stop()
+        self.temp.cleanup()
+
+    def test_token_and_idempotent_upload(self):
+        self.assertEqual(self.client.get('/v1/health').status_code, 401)
+        with patch.object(self.agent, 'start_job'):
+            first = self.client.post('/v1/jobs', content=b'audio', headers=self.headers)
+            second = self.client.post('/v1/jobs', content=b'audio', headers=self.headers)
+        self.assertEqual(first.status_code, 202)
+        self.assertEqual(second.json()['id'], first.json()['id'])
+        self.assertEqual(len(self.agent.jobs), 1)
+
+    def test_failed_job_can_be_deleted_and_retention_cleans_it(self):
+        with patch.object(self.agent, 'start_job'):
+            job_id = self.client.post('/v1/jobs', content=b'audio', headers=self.headers).json()['id']
+        job = self.agent.jobs[job_id]
+        self.agent.update_job(job, persist=True, status='failed', finished_at=0, error='failed')
+        self.agent.cleanup_finished(max_age=0)
+        self.assertNotIn(job_id, self.agent.jobs)
+        self.assertFalse(job['folder'].exists())
 
 
 class PlayNextTests(unittest.IsolatedAsyncioTestCase):

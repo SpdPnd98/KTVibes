@@ -32,7 +32,7 @@ function header(){
  $('lv-play').classList.toggle('playing',!!state?.playing);$('lv-play').setAttribute('aria-label',state?.playing?'Pause':'Play');
  if((c?.key||'')===song)return;song=c?.key||'';
  $('lv-title').textContent=c?.title||'Nothing playing';$('lv-artist').textContent=c?.artist||'';
- $('lv-art').src=c?thumbnail(c.id):'';
+ $('lv-art').src=c?(c.thumbnail||thumbnail(c.id)):'';
 }
 
 function tick(){

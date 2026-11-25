@@ -3,37 +3,58 @@ from contextlib import asynccontextmanager, suppress
 import io
 import json
 import os
+import re
+import secrets
 import shutil
 from pathlib import Path
 import socket
 import math
+from typing import Literal
+from uuid import uuid4
 import qrcode
 import qrcode.image.svg
-from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 from .queue import State
-from . import lyrics, songbook, stems, worker, youtube
+from . import curator, lyrics, renderers, songbook, stems, worker, youtube
+from .library import Library
 
 ROOT = Path(__file__).resolve().parent.parent
 CACHE = Path(os.environ.get("KTVIBES_CACHE", ROOT / "cache"))
 PORT = int(os.environ.get("KTVIBES_PORT", 8765))
 state = State()
+catalog = None
+RECORDING_ID = re.compile(r"(?:[A-Za-z0-9_-]{11}|local_[A-Za-z0-9_-]{16})")
+
+def import_root() -> Path | None:
+    configured = os.environ.get("KTVIBES_IMPORT_ROOT")
+    if configured:
+        return Path(configured).expanduser()
+    shared = Path("/Volumes/Karaoke Shared/incoming")
+    return shared if shared.is_dir() else None
 
 @asynccontextmanager
 async def lifespan(app):
+    global catalog
     CACHE.mkdir(parents=True, exist_ok=True)
+    catalog = Library(CACHE / "library.sqlite3", import_root())
     state.build = build()
     await asyncio.to_thread(songbook.backfill, CACHE, stems.prepared)  # caches from before the songbook
-    state.restore(CACHE / "queue.json", seed=lambda: {id: meta["prepared"] for id, meta in prepared_songs().items()})
-    task = asyncio.create_task(worker.run(state, CACHE))
+    prepared = prepared_songs()
+    await asyncio.to_thread(catalog.reconcile, set(prepared))
+    state.restore(CACHE / "queue.json", seed=lambda: {id: meta["prepared"] for id, meta in prepared.items()})
+    tasks = [asyncio.create_task(worker.run(state, CACHE, catalog)),
+             asyncio.create_task(curator.run(state, CACHE, catalog))]
     try:
         yield
     finally:
-        task.cancel()
-        with suppress(asyncio.CancelledError):
-            await task
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
+            with suppress(asyncio.CancelledError):
+                await task
 
 def build() -> str:
     """Fingerprint of the files the pages load. A TV left open across an update reloads itself
@@ -67,6 +88,10 @@ async def tv():
 async def remote():
     return FileResponse(ROOT / "static/remote.html")
 
+@app.get("/owner")
+async def owner():
+    return FileResponse(ROOT / "static/owner.html")
+
 @app.get("/api/state")
 async def get_state():
     return state.snapshot()
@@ -96,7 +121,7 @@ async def search(q: str = Query(min_length=1, max_length=200), page: int = Query
     return [{**result, "cached": result["id"] in cached} for result in results]
 
 class Song(BaseModel):
-    id: str = Field(pattern=r"^[A-Za-z0-9_-]{11}$")
+    id: str = Field(pattern=r"^(?:[A-Za-z0-9_-]{11}|local_[A-Za-z0-9_-]{16})$")
     artist: str = Field(min_length=1, max_length=200)
     title: str = Field(min_length=1, max_length=300)
 
@@ -108,9 +133,154 @@ class Song(BaseModel):
             raise ValueError("Artist and title must not be blank")
         return value
 
+def owner_store(request: Request) -> Library:
+    """Owner APIs are local-only unless an explicit shared token is configured."""
+    expected = os.environ.get("KTVIBES_OWNER_TOKEN")
+    supplied = request.headers.get("X-KTVibes-Owner-Token", "")
+    if expected:
+        if not secrets.compare_digest(expected, supplied):
+            raise HTTPException(401, "Owner token required")
+    elif not request.client or request.client.host not in ("127.0.0.1", "::1", "testclient"):
+        raise HTTPException(403, "Set KTVIBES_OWNER_TOKEN to use owner tools over the network")
+    if catalog is None:
+        raise HTTPException(503, "Library is starting")
+    return catalog
+
+class CSVImport(BaseModel):
+    content: str = Field(min_length=1, max_length=10_000_000)
+
+class CandidateAction(BaseModel):
+    ids: list[int] = Field(min_length=1, max_length=500)
+
+class CandidateReview(CandidateAction):
+    status: Literal["pending", "approved", "rejected", "deferred"]
+
+class RendererInput(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    url: str = Field(min_length=1, max_length=300)
+
+    @field_validator("name", "url")
+    @classmethod
+    def trim_renderer(cls, value):
+        return value.strip()
+
+class RendererChoice(BaseModel):
+    id: str = Field(min_length=1, max_length=100)
+
+@app.get("/api/owner/candidates")
+async def owner_candidates(request: Request, status: Literal["pending", "approved", "rejected", "deferred"] | None = None):
+    library = owner_store(request)
+    return await asyncio.to_thread(library.candidates, status)
+
+@app.post("/api/owner/import", status_code=201)
+async def owner_import(imported: CSVImport, request: Request):
+    library = owner_store(request)
+    try:
+        return await asyncio.to_thread(library.import_csv, imported.content)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+@app.get("/api/owner/import-folder")
+async def owner_import_folder_status(request: Request):
+    library = owner_store(request)
+    if library.import_root is None and (detected := import_root()) is not None:
+        library.import_root = detected.resolve()
+    root = library.import_root
+    return {"configured": root is not None, "available": bool(root and root.is_dir()),
+            "root": str(root) if root else None}
+
+@app.post("/api/owner/import-folder", status_code=201)
+async def owner_scan_import_folder(request: Request):
+    library = owner_store(request)
+    if library.import_root is None and (detected := import_root()) is not None:
+        library.import_root = detected.resolve()
+    try:
+        return await asyncio.to_thread(library.scan_imports)
+    except (OSError, ValueError) as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+@app.post("/api/owner/candidates/review")
+async def owner_review(review: CandidateReview, request: Request):
+    library = owner_store(request)
+    try:
+        changed = await asyncio.to_thread(library.review, review.ids, review.status)
+    except KeyError as exc:
+        raise HTTPException(404, str(exc.args[0])) from exc
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {"changed": changed, "status": review.status}
+
+@app.post("/api/owner/jobs", status_code=201)
+async def owner_prepare(action: CandidateAction, request: Request):
+    library = owner_store(request)
+    try:
+        queued = await asyncio.to_thread(library.enqueue, action.ids)
+    except KeyError as exc:
+        raise HTTPException(404, str(exc.args[0])) from exc
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {"queued": queued}
+
+@app.get("/api/owner/jobs")
+async def owner_jobs(request: Request):
+    library = owner_store(request)
+    return await asyncio.to_thread(library.jobs)
+
+@app.get("/api/owner/renderers")
+async def owner_renderers(request: Request):
+    library = owner_store(request)
+    return await asyncio.to_thread(library.renderers)
+
+@app.post("/api/owner/renderers", status_code=201)
+async def owner_add_renderer(renderer: RendererInput, request: Request):
+    library = owner_store(request)
+    try:
+        url = renderers.normalize_url(renderer.url)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    return await asyncio.to_thread(library.add_renderer, uuid4().hex, renderer.name, url)
+
+@app.post("/api/owner/renderers/select")
+async def owner_select_renderer(choice: RendererChoice, request: Request):
+    library = owner_store(request)
+    try:
+        await asyncio.to_thread(library.select_renderer, choice.id)
+    except KeyError as exc:
+        raise HTTPException(404, str(exc.args[0])) from exc
+    return {"selected": choice.id}
+
+@app.get("/api/owner/renderers/{renderer_id}/health")
+async def owner_renderer_health(renderer_id: str, request: Request):
+    library = owner_store(request)
+    renderer = next((item for item in await asyncio.to_thread(library.renderers) if item["id"] == renderer_id), None)
+    if not renderer:
+        raise HTTPException(404, "Renderer not found")
+    try:
+        result = await asyncio.to_thread(renderers.health, renderer)
+    except Exception as exc:
+        raise HTTPException(502, f"Renderer unavailable: {exc}") from exc
+    if renderer_id != "local":
+        try:
+            await asyncio.to_thread(library.renderer_seen, renderer_id, result["machine_id"])
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+    return result
+
+@app.delete("/api/owner/renderers/{renderer_id}")
+async def owner_delete_renderer(renderer_id: str, request: Request):
+    library = owner_store(request)
+    try:
+        await asyncio.to_thread(library.delete_renderer, renderer_id)
+    except KeyError as exc:
+        raise HTTPException(404, str(exc.args[0])) from exc
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {"deleted": renderer_id}
+
 def prepared_songs() -> dict:
     """Cached songs with stems and confirmed details, by video id."""
     songs = {}
+    active_local = catalog.active_local_ids() if catalog is not None else None
     for meta_path in CACHE.glob("*/meta.json"):
         try:
             meta = json.loads(meta_path.read_text(encoding="utf-8"))
@@ -118,9 +288,12 @@ def prepared_songs() -> dict:
         except (OSError, ValueError):
             continue
         video_id = meta_path.parent.name
-        if youtube.ID.fullmatch(video_id) and meta.get("artist") and meta.get("title") and stems.prepared(meta_path.parent):
+        if meta.get("provider") == "local" and active_local is not None and video_id not in active_local:
+            continue  # a changed shared file supersedes its old prepared generation
+        if RECORDING_ID.fullmatch(video_id) and meta.get("artist") and meta.get("title") and stems.prepared(meta_path.parent):
+            thumbnail = "/static/local-track.svg" if meta.get("provider") == "local" else f"https://i.ytimg.com/vi/{video_id}/mqdefault.jpg"
             songs[video_id] = {"id": video_id, "artist": meta["artist"], "title": meta["title"], "duration": meta.get("duration"),
-                               "thumbnail": f"https://i.ytimg.com/vi/{video_id}/mqdefault.jpg", "prepared": prepared, "number": meta.get("number")}
+                                "thumbnail": thumbnail, "prepared": prepared, "number": meta.get("number")}
     return songs
 
 @app.get("/api/recent")
@@ -141,11 +314,11 @@ async def songbook_list():
 async def ambient():
     """Cached music videos the TV loops, muted, behind an empty stage: only songs that were prepared,
     so a video left behind by a failed download never shows up between songs."""
-    return sorted(path.parent.name for path in CACHE.glob("*/video.mp4") if youtube.ID.fullmatch(path.parent.name) and stems.prepared(path.parent))
+    return sorted(path.parent.name for path in CACHE.glob("*/video.mp4") if RECORDING_ID.fullmatch(path.parent.name) and stems.prepared(path.parent))
 
 def song_meta(video_id: str) -> tuple[Path, dict]:
     folder = CACHE / video_id
-    if not youtube.ID.fullmatch(video_id) or not (folder / "meta.json").is_file():
+    if not RECORDING_ID.fullmatch(video_id) or not (folder / "meta.json").is_file():
         raise HTTPException(404, "Song not found")
     meta = json.loads((folder / "meta.json").read_text(encoding="utf-8"))
     if not meta.get("artist") or not meta.get("title") or not meta.get("duration"):
@@ -221,7 +394,7 @@ async def choose_lyrics(video_id: str, choice: LyricChoice):
 async def delete_song(video_id: str):
     """Forget a song and delete its download; queueing it again downloads it fresh."""
     folder = CACHE / video_id
-    if not youtube.ID.fullmatch(video_id) or not (folder.is_dir() or video_id in state.played):
+    if not RECORDING_ID.fullmatch(video_id) or not (folder.is_dir() or video_id in state.played):
         raise HTTPException(404, "Song not found")
     if state.queued(video_id):
         raise HTTPException(409, "Remove it from the queue first")
@@ -230,6 +403,8 @@ async def delete_song(video_id: str):
         folder.unlink()
     elif folder.is_dir():
         await asyncio.to_thread(shutil.rmtree, folder)
+    if catalog is not None:
+        await asyncio.to_thread(catalog.reconcile, set(prepared_songs()))
     await state.broadcast()
     return {"deleted": video_id}
 
@@ -251,7 +426,7 @@ async def enqueue_next(song: Song):
 @app.get("/media/{video_id}/{filename}")
 async def media(video_id: str, filename: str):
     """Stems are requested by name (vocals, no_vocals) and served in whichever format is cached."""
-    if not youtube.ID.fullmatch(video_id) or filename not in (*stems.NAMES, "video.mp4"):
+    if not RECORDING_ID.fullmatch(video_id) or filename not in (*stems.NAMES, "video.mp4"):
         raise HTTPException(404)
     folder = CACHE / video_id
     path = folder / filename if filename == "video.mp4" else stems.path(folder, filename)

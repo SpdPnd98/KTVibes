@@ -24,6 +24,7 @@ dependencies = [
 
 [project.scripts]
 ktvibes = "ktvibes.main:run"
+ktvibes-renderer = "ktvibes.render_agent:run"
 
 [build-system]
 requires = ["hatchling"]

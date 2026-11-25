@@ -19,6 +19,14 @@ def _device() -> str:
         return "mps"
     return "cpu"
 
+def backend_info() -> dict:
+    device = _device()
+    hip = getattr(torch.version, "hip", None)
+    backend = "rocm" if device == "cuda" and hip else device
+    name = torch.cuda.get_device_name(0) if device == "cuda" else ("Apple Silicon" if device == "mps" else "CPU")
+    return {"backend": backend, "device": device, "gpu": name, "torch": torch.__version__,
+            "hip": hip, "cuda": getattr(torch.version, "cuda", None)}
+
 def _load():
     global _model
     if _model is None:

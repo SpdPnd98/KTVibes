@@ -28,6 +28,7 @@
 - **Party-friendly display.** Blur or hide the music video, show lyrics as two karaoke lines (the default) or a scrolling list, or hide them.
 - **Phone remote.** Scan the QR code on the TV to join. Everyone shares one queue: reorder, undo removals, and re-add recent songs. The TV shows a popup card for every change.
 - **Lyrics picker.** If a song has lyrics in several languages or editions (e.g. a K-pop song's Japanese release), choose which one to show. If none were found, or the wrong song came up, search LRCLIB by hand from the remote.
+- **Backstage library.** Import a CSV, approve songs in batches, prepare them before the party, and optionally send vocal separation to another machine on the LAN.
 
 <p align="center">
   <img src="docs/tv-lyrics.jpg" width="49%" alt="TV: Jay Chou with pinyin over each character">
@@ -82,6 +83,52 @@ Allow incoming connections if your firewall asks, so phones can reach the remote
 
 The first song starts as soon as it is ready. Later songs are prepared while earlier ones play, so queue a few ahead; without a GPU, a song takes a minute or so to prepare. Re-queuing a song is instant because everything is cached in `cache/`.
 
+### Curated library
+
+Open `http://localhost:8765/owner` on the KTVibes machine. To use Backstage from another device, set `KTVIBES_OWNER_TOKEN` before starting KTVibes and enter that token on the page.
+
+For shared M4A files, put tracks in the configured import folder using `Artist - Title.m4a` names, then choose **Scan shared M4As** in Backstage. On this custom macOS setup, `/Volumes/Karaoke Shared/incoming` is detected automatically when mounted. Files remain on the share; KTVibes verifies and copies each source into its local cache before processing. Local tracks have no music video unless one is added separately.
+
+For another mount, set the folder before starting KTVibes:
+
+```bash
+export KTVIBES_IMPORT_ROOT='/path/to/shared/incoming'
+uv run ktvibes
+```
+
+Alternatively, import a UTF-8 CSV. Use `source_id` for YouTube or `filename` for an M4A relative to `KTVIBES_IMPORT_ROOT`:
+
+```csv
+artist,title,language,source_id
+IU,Good Day,ko,abcdefghijk
+Aimer,Ref:rain,ja,bbbbbbbbbbb
+```
+
+```csv
+artist,title,language,filename
+IU,Good Day,ko,IU - Good Day.m4a
+Aimer,Ref:rain,ja,Aimer - Ref-rain.m4a
+```
+
+`artist` and `title` are required. `language` is optional. Importing the same source again updates its display metadata without losing its review decision. If a shared file changes, scan again; its checksum and cache identity are refreshed so stale stems are not reused.
+
+Approved preparation jobs are persistent. They run only when no live queue item is waiting for preparation. A job already separating cannot be preempted, but the next bulk song waits for the live queue. Finished songs enter the existing songbook and play from the karaoke machine's cache.
+
+### Separate GPU machine
+
+Install the same KTVibes checkout and its dependencies on the GPU machine. Set one shared renderer token on both machines, then start the render agent on the GPU machine:
+
+```bash
+export KTVIBES_RENDERER_TOKEN='replace-with-a-long-random-value'
+uv run ktvibes-renderer
+```
+
+Start the main KTVibes server with the same `KTVIBES_RENDERER_TOKEN`. In Backstage, add the GPU machine as `http://<private-ip>:8790`, check its health, and select it. The karaoke machine still downloads and stores media; only Demucs separation is sent to the GPU machine. If that machine is unavailable, the job fails visibly and can be prepared again after the connection is restored. Already-prepared songs continue to play.
+
+Use this plain-HTTP mode only on a trusted wired LAN or an encrypted private network such as Tailscale/WireGuard. The token and song audio are not protected from network inspection by HTTP. A reverse proxy with HTTPS can be used when the private network is not trusted.
+
+ROCm is reported when the installed PyTorch build exposes `torch.version.hip`, but AMD support is not enabled by the default CUDA dependency lock and has not been validated here. Install a PyTorch/torchaudio build compatible with the exact GPU, OS, driver, and ROCm version, then test a real song before relying on it.
+
 ### Classic theme
 
 Switch to Classic in the remote's **Settings** (or on the TV before you enable sound). The remote's tabs are:
@@ -123,6 +170,11 @@ This pulls the latest version; the next `ktvibes` installs any new dependencies.
 | `KTVIBES_COOKIES_FROM_BROWSER` | unset | If songs fail with "Sign in to confirm you're not a bot", set this to a browser you're signed in to YouTube with (`chrome`, `firefox`, `edge`, `safari`…), and KTVibes uses its YouTube cookies |
 | `KTVIBES_VIDEO_HEIGHT` | `720` | Highest music video resolution to download, e.g. `1080` (about twice the size) |
 | `KTVIBES_OPEN_BROWSER` | unset | Set to `1` to open the TV page in the default browser when KTVibes starts. The desktop apps do this |
+| `KTVIBES_IMPORT_ROOT` | auto-detected on this Mac | Shared folder containing source M4A files; paths in CSV files are relative to this folder |
+| `KTVIBES_OWNER_TOKEN` | unset | Token required for Backstage over the network; without it owner APIs accept only local requests |
+| `KTVIBES_RENDERER_TOKEN` | unset | Shared token used between the controller and a render agent |
+| `KTVIBES_RENDERER_PORT` | `8790` | Port used by `ktvibes-renderer` |
+| `KTVIBES_RENDERER_CACHE` | `~/.cache/ktvibes-renderer` | Render-agent staging and recovery directory |
 
 Run a single server process: the queue and the GPU models live in memory.
 
@@ -147,7 +199,7 @@ LRCLIB ──────────▶ line-timed lyrics ──MMS aligner─�
 | Step | What happens | Time |
 |---|---|---|
 | Download | Audio and H.264 video (up to 1080p) | network-bound |
-| Separate | Demucs `htdemucs` splits vocals from the music, saved as FLAC | 5–35 s |
+| Separate | Demucs `htdemucs` splits vocals from the music, saved as Ogg Opus | 5–35 s |
 | Lyrics | LRCLIB lookup in the song's own script; pick another language from the remote | 1–3 s |
 | Timing | Forced alignment of each line against the vocals; energy estimate as fallback | 1–5 s |
 | Play | The TV plays both tracks in sync with the video; key shift runs in an AudioWorklet | — |
@@ -189,7 +241,9 @@ uv run python -m ktvibes.separate cache/fJ9rUzIMcZQ/audio.m4a cache/fJ9rUzIMcZQ
 
 `ktvibes/main.py` serves the API, WebSocket, media range requests, QR, and static pages. `queue.py` owns state, and `worker.py` prepares one entry at a time. `youtube.py`, `lyrics.py`, and `separate.py` wrap the external providers. The frontend is plain HTML/CSS/JavaScript with no build step.
 
-The queue and the media cache persist across restarts. Microphone input, scoring and authentication are not included. The remote is intended for your local network.
+The queue, curated library database, preparation jobs and media cache persist across restarts. The database is `cache/library.sqlite3` and is created automatically; existing media caches are not rewritten during migration. Stop KTVibes before copying the cache for backup so SQLite's WAL is fully included. To roll back this feature, stop KTVibes and move `library.sqlite3` aside; the original queue and prepared-song playback remain file-based.
+
+Guest playback controls remain unauthenticated and are intended for your local network. Backstage has token protection for non-local access, and the render agent rejects non-local requests until a renderer token is configured.
 
 ## Thanks
 

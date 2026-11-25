@@ -32,7 +32,7 @@ function render(next){
 }
 // Now playing: a card at the top, handing over to the dock once scrolled away.
 function showNow(first){
- const c=state.current,art=c?thumbnail(c.id):'';
+  const c=state.current,art=c?(c.thumbnail||thumbnail(c.id)):'';
  showHero(!!c,first);$('hero').classList.toggle('paused',!state.playing);$('hero').classList.toggle('offline',!state.player_connected);$('cheers').classList.toggle('offline',!state.player_connected);$('hero-state').textContent=state.playing?'Now singing':'Paused';
  for(const id of ['hero-play','dock-play']){$(id).classList.toggle('playing',!!(c&&state.playing));$(id).setAttribute('aria-label',state.playing?'Pause':'Play');$(id).disabled=!c;}
  // The card keeps its last song while it folds away.
@@ -275,7 +275,7 @@ function emptyQueue(){
 const GRIP='<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="9" cy="6" r="1.6"/><circle cx="15" cy="6" r="1.6"/><circle cx="9" cy="12" r="1.6"/><circle cx="15" cy="12" r="1.6"/><circle cx="9" cy="18" r="1.6"/><circle cx="15" cy="18" r="1.6"/></svg>';
 function queueRow(item,index,justReady){
  const row=el('article',undefined,`row ${item.status}`);row.dataset.key=item.key;
- const thumb=el('div',undefined,'thumb'),image=el('img',undefined,'art');image.src=thumbnail(item.id);image.alt='';thumb.append(image);
+  const thumb=el('div',undefined,'thumb'),image=el('img',undefined,'art');image.src=item.thumbnail||thumbnail(item.id);image.alt='';thumb.append(image);
  // The ring shows while the song prepares, and once more as it turns ready.
  if(item.status!=='ready'&&item.status!=='error'||justReady&&item.status==='ready')thumb.insertAdjacentHTML('beforeend',`<svg class="ring" viewBox="0 0 52 52" style="--c:${RING}" aria-hidden="true"><circle class="track" cx="26" cy="26" r="23"/><circle class="fill" cx="26" cy="26" r="23"/></svg>`);
  if(justReady&&item.status==='ready')haptic(10);

@@ -87,7 +87,7 @@ function render(next){
    video.hidden=!item.video;$('video-shade').hidden=!item.video;
    if(item.video){video.src=`/media/${item.id}/video.mp4`;video.load();}else{video.removeAttribute('src');video.load();}
    stemGain=item.gain||1;applyGain();seekTo=state.position||0;music.src=`/media/${item.id}/no_vocals`;voice.src=`/media/${item.id}/vocals`;music.load();voice.load();
-   $('song-title').textContent=item.title;$('song-artist').textContent=item.artist;$('next-title').textContent=$('card-title').textContent=item.title;$('next-art').src=thumbnail(item.id,'hqdefault');$('next-artist').textContent=$('card-artist').textContent=item.artist;$('card-number').textContent=item.number??'-----';$('card-credit').textContent=`원곡 ${item.artist}`;$('spec-length').textContent=clock(item.duration);
+    $('song-title').textContent=item.title;$('song-artist').textContent=item.artist;$('next-title').textContent=$('card-title').textContent=item.title;$('next-art').src=item.thumbnail||thumbnail(item.id,'hqdefault');$('next-artist').textContent=$('card-artist').textContent=item.artist;$('card-number').textContent=item.number??'-----';$('card-credit').textContent=`원곡 ${item.artist}`;$('spec-length').textContent=clock(item.duration);
    showLyrics(item);$('duration').textContent=clock(item.duration);
   }else{lyrics=[];firstLine=-1;video.pause();video.removeAttribute('src');video.load();video.hidden=true;$('video-shade').hidden=true;music.removeAttribute('src');voice.removeAttribute('src');music.load();voice.load();$('elapsed').textContent='0:00';$('duration').textContent='0:00';$('progress').parentElement.style.setProperty('--p',0);}
  }

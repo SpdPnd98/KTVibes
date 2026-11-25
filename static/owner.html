@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#0b0f14">
+  <title>KTVibes Backstage</title>
+  <link rel="icon" href="/static/favicon-48.png" sizes="48x48" type="image/png">
+  <link rel="stylesheet" href="/static/owner.css">
+</head>
+<body>
+  <header class="mast">
+    <div><a href="/remote" class="wordmark">KT<span>Vibes</span></a><p>BACKSTAGE / LIBRARY OPERATIONS</p></div>
+    <div class="mast-actions"><span id="auth-state">Local access</span><button id="set-token" class="quiet">Owner token</button><a href="/remote" class="quiet button">Open remote</a></div>
+  </header>
+  <main>
+    <section class="panel intro">
+      <div><span class="kicker">01 / INGEST</span><h1>Build the set before the room fills.</h1><p>Import songs, approve the right recordings, and prepare them on the selected render machine.</p></div>
+      <form id="import-form" class="import-box">
+        <label for="csv">Song list CSV</label>
+        <input id="csv" type="file" accept=".csv,text/csv" required>
+        <small>Required: artist, title. Optional: language, source_id (YouTube ID), or filename (shared M4A).</small>
+        <button>Import list</button>
+        <div class="share-source"><span id="import-root">Checking shared folder...</span><button id="scan-shared" type="button" class="quiet">Scan shared M4As</button></div>
+      </form>
+    </section>
+
+    <section class="panel renderer-panel">
+      <div class="section-head"><div><span class="kicker">02 / COMPUTE</span><h2>Render machine</h2></div><span id="renderer-summary" class="summary">Loading...</span></div>
+      <div id="renderers" class="renderer-list"></div>
+      <form id="renderer-form" class="renderer-form">
+        <input id="renderer-name" maxlength="100" placeholder="Machine name" aria-label="Machine name" required>
+        <input id="renderer-url" maxlength="300" placeholder="http://192.168.1.42:8790" aria-label="Renderer URL" required>
+        <button>Add machine</button>
+      </form>
+      <p class="note">Only literal private LAN or Tailscale IP addresses are accepted. Configure the same <code>KTVIBES_RENDERER_TOKEN</code> on both machines.</p>
+    </section>
+
+    <section class="panel catalog-panel">
+      <div class="section-head"><div><span class="kicker">03 / CURATE</span><h2>Candidate songs</h2></div><span id="candidate-count" class="summary"></span></div>
+      <div class="toolbar">
+        <div id="filters" class="filters" role="group" aria-label="Review status">
+          <button data-status="pending" class="active">Pending</button><button data-status="approved">Approved</button><button data-status="deferred">Deferred</button><button data-status="rejected">Rejected</button>
+        </div>
+        <label class="select-all"><input id="select-all" type="checkbox"> Select visible</label>
+      </div>
+      <div id="candidates" class="candidate-list" aria-live="polite"></div>
+      <div id="bulk" class="bulk" hidden><b id="selected-count"></b><button data-review="approved">Approve</button><button data-review="deferred" class="quiet">Defer</button><button data-review="rejected" class="danger">Reject</button><button id="prepare">Prepare approved</button></div>
+    </section>
+
+    <section class="panel jobs-panel">
+      <div class="section-head"><div><span class="kicker">04 / OUTPUT</span><h2>Preparation jobs</h2></div><button id="refresh-jobs" class="quiet">Refresh</button></div>
+      <div id="jobs" class="jobs"></div>
+    </section>
+  </main>
+  <div id="toast" class="toast" role="status" hidden></div>
+  <script type="module" src="/static/owner.js"></script>
+</body>
+</html>

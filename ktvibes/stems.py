@@ -22,11 +22,11 @@ def path(folder: Path, name: str) -> Path | None:
     return None
 
 def ready(folder: Path) -> bool:
-    return all((folder / f"{name}.opus").is_file() for name in NAMES)
+    return not (folder / ".stems-incomplete").exists() and all((folder / f"{name}.opus").is_file() for name in NAMES)
 
 def prepared(folder: Path) -> bool:
     """Stems exist in any format (older ones convert when the song is next queued)."""
-    return all(path(folder, name) for name in NAMES)
+    return not (folder / ".stems-incomplete").exists() and all(path(folder, name) for name in NAMES)
 
 def resample(data, rate: int):
     if rate == RATE:
@@ -47,6 +47,7 @@ def write(folder: Path, vocals, instrumental, rate: int) -> float:
     from concurrent.futures import ThreadPoolExecutor
     with ThreadPoolExecutor(len(NAMES)) as pool:
         list(pool.map(save, NAMES, (vocals, instrumental)))
+    (folder / ".stems-incomplete").unlink(missing_ok=True)
     return 1 / scale
 
 def migrate(folder: Path, gain: float | None) -> float | None:

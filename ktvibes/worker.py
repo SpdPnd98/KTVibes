@@ -2,10 +2,12 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import time
 from pathlib import Path
 import soundfile as sf
 from . import align, guides, songbook, stems, youtube, lyrics
+from .library import open_beneath
 
 log = logging.getLogger(__name__)
 TIMING_VERSION = 10  # bump when alignment changes, so cached timing is rebuilt
@@ -14,10 +16,10 @@ GUIDES_VERSION = 1  # bump when guide output changes: cached timing keeps, and o
 LYRICS_RECHECK = 7 * 86400  # a song LRCLIB had no lyrics for is looked up again after this long
 STARTED = time.time()  # energy-only timing (aligner failed) cached before this run is retried once
 
-def separate(source, destination, progress=None):
-    # Keep model imports off the server startup path.
-    from .separate import separate as separate_audio
-    return separate_audio(source, destination, progress)
+def separate(source, destination, progress=None, library=None, renderer_id=None):
+    # Keep model imports off the server startup path. The selected renderer may be another machine.
+    from .renderers import separate as separate_audio
+    return separate_audio(source, destination, progress, library, renderer_id)
 
 def reporter(state, item, step):
     """Progress callback for worker threads: while `step` is the one on show, record the fraction; broadcast at most twice a second."""
@@ -50,6 +52,26 @@ def fetch_video(video_id, folder, progress):
     except Exception:
         log.exception("Video unavailable for %s", video_id)
         return "Video unavailable; using the stage background."
+
+def stage_local(root: Path, relative: str, destination: Path, expected_hash: str, progress=None):
+    """Copy a shared M4A into the local cache and verify it did not change after import."""
+    digest = hashlib.sha256()
+    copied = 0
+    temporary = destination / "audio.tmp.m4a"
+    try:
+        with open_beneath(root, relative) as incoming, temporary.open("wb") as output:
+            size = os.fstat(incoming.fileno()).st_size
+            for chunk in iter(lambda: incoming.read(1024 * 1024), b""):
+                output.write(chunk)
+                digest.update(chunk)
+                copied += len(chunk)
+                if progress and size:
+                    progress(copied / size)
+        if digest.hexdigest() != expected_hash:
+            raise ValueError("Shared-media file changed after import; scan the folder again")
+        temporary.replace(destination / "audio.m4a")
+    finally:
+        temporary.unlink(missing_ok=True)
 
 def add_guides(lines: list[dict]) -> list[dict]:
     """Every pronunciation guide; each writes only its own unit slots, so cached lines can be redone."""
@@ -104,127 +126,156 @@ class Removed(Exception):
 
 # Video downloads still running, by video id: a song queued again reuses its download instead of starting a second.
 videos = {}
+preparation_locks = {}
+publish_lock = asyncio.Lock()
 
-def warm_models():
+def warm_models(library=None):
     """Both models take seconds to load; load them while the server starts, not when the first song is queued."""
-    from . import separate as separation
-    for name, load in (("separation", separation.warm), ("alignment", align.warm)):
+    models = [("alignment", align.warm)]
+    if not library or library.selected_renderer()["id"] == "local":
+        from . import separate as separation
+        models.insert(0, ("separation", separation.warm))
+    for name, load in models:
         try:
             load()
         except Exception:
             log.exception("Could not preload the %s model", name)
 
-async def run(state, cache: Path):
-    warming = asyncio.create_task(asyncio.to_thread(warm_models))  # noqa: F841 (held so the task isn't collected)
+async def _prepare(state, item, cache: Path, library=None, promote=True, renderer_id=None):
+    """Prepare one queue or curated-library item using the same cache and artifact contract."""
+    folder = cache / item["id"]
+    def check():
+        # A removed live song stops holding up the queue. Curated jobs are not queue members.
+        if promote and item is not state.current and item not in state.upcoming:
+            raise Removed
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+        meta_path = folder / "meta.json"
+        meta = songbook.read(meta_path) or {}
+        local = item.get("provider", meta.get("provider")) == "local"
+        item["provider"] = "local" if local else "youtube"
+        item["thumbnail"] = "/static/local-track.svg" if local else f"https://i.ytimg.com/vi/{item['id']}/mqdefault.jpg"
+        # The (larger, optional) video downloads while the audio is fetched and separated.
+        video = None
+        if not local and not (folder / "video.mp4").is_file():
+            video = videos.get(item["id"])
+            if video is None or video.done():
+                video = videos[item["id"]] = asyncio.ensure_future(asyncio.to_thread(fetch_video, item["id"], folder, reporter(state, item, "video")))
+        if not stems.ready(folder):
+            # Songs cached as WAV or FLAC convert in seconds instead of separating again.
+            gain = await asyncio.to_thread(stems.migrate, folder, meta.get("stem_gain"))
+            if gain is None:
+                if not (folder / "audio.m4a").is_file():
+                    item["status"], item["step"], item["progress"] = "downloading", "audio", 0.0
+                    await state.broadcast()
+                    if local:
+                        await asyncio.to_thread(stage_local, Path(item["source_root"]), item["source_path"], folder, item["source_hash"],
+                                                reporter(state, item, "audio"))
+                        meta.update(provider="local", source_path=item["source_path"], source_hash=item["source_hash"])
+                    else:
+                        meta.update(await asyncio.to_thread(youtube.download, item["id"], folder, reporter(state, item, "audio")))
+                    check()
+                item["status"], item["step"], item["progress"] = "separating", "vocals", 0.0
+                await state.broadcast()
+                meta["separation_seconds"], gain = await asyncio.to_thread(
+                    separate, folder / "audio.m4a", folder, reporter(state, item, "vocals"), library, renderer_id)
+            meta["stem_gain"] = gain
+            save_meta(folder, meta)  # the gain must survive even if a later step fails
+        check()
+        if video and not video.done():
+            item["status"], item["step"], item["progress"] = "downloading", "video", 0.0
+            await state.broadcast()
+            while not video.done():
+                await asyncio.wait({video}, timeout=0.5)
+                check()
+        if video and (warning := await video):
+            item["video_warning"] = warning
+        item["video"] = (folder / "video.mp4").is_file()
+        item["duration"] = sf.info(stems.path(folder, "no_vocals")).duration
+        # Where the song stops, before any trailing silence: Classic scores it there. Remembered per stem
+        # file, and left unset (the TV waits for the file's end) if a stem can't be read.
+        stamps = [p.stat().st_mtime for name in stems.NAMES if (p := stems.path(folder, name))]
+        meta.pop("music_end", None)  # the old instrumental-only value
+        known = meta.get("song_end")
+        if stamps and not (isinstance(known, list) and len(known) == 2 and known[0] == stamps):
+            end = await asyncio.to_thread(stems.song_end, folder)
+            known = meta["song_end"] = [stamps, end] if end else None
+        if stamps and known:
+            item["music_end"] = known[1]
+        item["gain"] = float(meta.get("stem_gain") or 1)
+        item["status"], item["step"], item["progress"] = "syncing", None, None
+        await state.broadcast()
+        identity = [item["artist"], item["title"]]
+        cached = (folder / "lyrics.lrc").read_text(encoding="utf-8") if (folder / "lyrics.lrc").is_file() else ""
+        raw = ""
+        same = meta.get("lyrics_identity") == identity
+        if same and lyrics.parse_lrc(cached):
+            raw = cached
+            item["lyrics"] = lyrics.parse_lrc(cached)
+        elif same and time.time() - meta.get("lyrics_checked", 0) < LYRICS_RECHECK:
+            pass  # LRCLIB had none recently; "Lyrics language…" on the remote still searches
+        else:
+            try:
+                result = await lyrics.fetch(*identity, item["duration"], (meta.get("source_title") or "",))
+                raw, item["lyrics"] = result["raw"], result["lines"]
+                if not result.get("partial"):
+                    # A miss is remembered for a week, so a later LRCLIB addition is still picked up.
+                    meta["lyrics_identity"], meta["lyrics_checked"] = identity, time.time()
+                    meta.pop("lyric_offset", None)  # a nudge for other lyrics no longer fits
+                    if result["raw"]:
+                        (folder / "lyrics.lrc").write_text(result["raw"], encoding="utf-8")
+                    else:
+                        (folder / "lyrics.lrc").unlink(missing_ok=True)
+            except Exception:
+                log.exception("Lyrics unavailable for %s", item["id"])
+                item["lyrics_warning"] = "Lyrics unavailable; audio is ready."
+        if item["lyrics"]:
+            item["step"], item["progress"] = "timing", 0.0
+            await state.broadcast()
+            try:
+                item["lyrics"] = await asyncio.to_thread(timed_lyrics, folder, raw, stems.path(folder, "vocals"), item["lyrics"], reporter(state, item, "timing"))
+                lyrics.line_starts(item["lyrics"])  # cheap, so kept out of the timing cache
+            except Exception:
+                log.exception("Word timing unavailable for %s", item["id"])
+        item["offset"] = float(meta.get("lyric_offset") or 0)
+        meta.update(duration=item["duration"], artist=item["artist"], title=item["title"],
+                    provider=item.get("provider", meta.get("provider", "youtube")))
+        # Live and curated songs can finish together; keep number assignment and metadata publication atomic.
+        async with publish_lock:
+            item["number"] = songbook.assign(cache, meta)
+            save_meta(folder, meta)
+        check()
+        item["status"], item["step"], item["progress"] = "ready", None, None
+        if promote:
+            state.promote()
+    except Removed:
+        # Undoing the removal puts it back as queued, to be prepared again (fast from cache).
+        log.info("Stopped preparing %s: removed from the queue", item["id"])
+        item["status"], item["step"], item["progress"] = "queued", None, None
+    except Exception as exc:
+        log.exception("Preparation failed for %s", item["id"])
+        item["status"] = "error"
+        missing = missing_tools()
+        # A missing ffmpeg or Node.js surfaces as an obscure "WinError 2"; say what to fix instead.
+        item["error"] = f"{' and '.join(missing)} not found. Install, open a new terminal, restart KTVibes, then Retry." if missing else youtube.explain(exc)
+        if promote:
+            state.promote()
+    await state.broadcast()
+
+
+async def prepare(state, item, cache: Path, library=None, promote=True, renderer_id=None):
+    """Serialize one recording while allowing unrelated downloads and lyric work to overlap."""
+    lock = preparation_locks.setdefault(item["id"], asyncio.Lock())
+    async with lock:
+        await _prepare(state, item, cache, library, promote, renderer_id)
+
+
+async def run(state, cache: Path, library=None):
+    warming = asyncio.create_task(asyncio.to_thread(warm_models, library))  # noqa: F841 (held so the task isn't collected)
     while True:
         state.wake.clear()
         item = next((i for i in state.upcoming if i["status"] == "queued"), None)
         if item is None:
             await state.wake.wait()
             continue
-        folder = cache / item["id"]
-        def check():
-            # A removed song stops holding up the queue; a download already running finishes on its own.
-            if item is not state.current and item not in state.upcoming:
-                raise Removed
-        try:
-            folder.mkdir(parents=True, exist_ok=True)
-            meta_path = folder / "meta.json"
-            meta = songbook.read(meta_path) or {}
-            # The (larger, optional) video downloads while the audio is fetched and separated.
-            video = None
-            if not (folder / "video.mp4").is_file():
-                video = videos.get(item["id"])
-                if video is None or video.done():
-                    video = videos[item["id"]] = asyncio.ensure_future(asyncio.to_thread(fetch_video, item["id"], folder, reporter(state, item, "video")))
-            if not stems.ready(folder):
-                # Songs cached as WAV or FLAC convert in seconds instead of separating again.
-                gain = await asyncio.to_thread(stems.migrate, folder, meta.get("stem_gain"))
-                if gain is None:
-                    if not (folder / "audio.m4a").is_file():
-                        item["status"], item["step"], item["progress"] = "downloading", "audio", 0.0
-                        await state.broadcast()
-                        meta.update(await asyncio.to_thread(youtube.download, item["id"], folder, reporter(state, item, "audio")))
-                        check()
-                    item["status"], item["step"], item["progress"] = "separating", "vocals", 0.0
-                    await state.broadcast()
-                    meta["separation_seconds"], gain = await asyncio.to_thread(separate, folder / "audio.m4a", folder, reporter(state, item, "vocals"))
-                meta["stem_gain"] = gain
-                save_meta(folder, meta)  # the gain must survive even if a later step fails
-            check()
-            if video and not video.done():
-                item["status"], item["step"], item["progress"] = "downloading", "video", 0.0
-                await state.broadcast()
-                while not video.done():
-                    await asyncio.wait({video}, timeout=0.5)
-                    check()
-            if video and (warning := await video):
-                item["video_warning"] = warning
-            item["video"] = (folder / "video.mp4").is_file()
-            item["duration"] = sf.info(stems.path(folder, "no_vocals")).duration
-            # Where the song stops, before any trailing silence: Classic scores it there. Remembered per stem
-            # file, and left unset (the TV waits for the file's end) if a stem can't be read.
-            stamps = [p.stat().st_mtime for name in stems.NAMES if (p := stems.path(folder, name))]
-            meta.pop("music_end", None)  # the old instrumental-only value
-            known = meta.get("song_end")
-            if stamps and not (isinstance(known, list) and len(known) == 2 and known[0] == stamps):
-                end = await asyncio.to_thread(stems.song_end, folder)
-                known = meta["song_end"] = [stamps, end] if end else None
-            if stamps and known:
-                item["music_end"] = known[1]
-            item["gain"] = float(meta.get("stem_gain") or 1)
-            item["status"], item["step"], item["progress"] = "syncing", None, None
-            await state.broadcast()
-            identity = [item["artist"], item["title"]]
-            cached = (folder / "lyrics.lrc").read_text(encoding="utf-8") if (folder / "lyrics.lrc").is_file() else ""
-            raw = ""
-            same = meta.get("lyrics_identity") == identity
-            if same and lyrics.parse_lrc(cached):
-                raw = cached
-                item["lyrics"] = lyrics.parse_lrc(cached)
-            elif same and time.time() - meta.get("lyrics_checked", 0) < LYRICS_RECHECK:
-                pass  # LRCLIB had none recently; "Lyrics language…" on the remote still searches
-            else:
-                try:
-                    result = await lyrics.fetch(*identity, item["duration"], (meta.get("source_title") or "",))
-                    raw, item["lyrics"] = result["raw"], result["lines"]
-                    if result.get("partial"):
-                        pass  # LRCLIB cut the search short: sing what it found, but don't keep it as the answer
-                    else:
-                        # A miss is remembered for a week, so a later LRCLIB addition is still picked up.
-                        meta["lyrics_identity"], meta["lyrics_checked"] = identity, time.time()
-                        meta.pop("lyric_offset", None)  # a nudge for other lyrics no longer fits
-                        if result["raw"]:
-                            (folder / "lyrics.lrc").write_text(result["raw"], encoding="utf-8")
-                        else:
-                            (folder / "lyrics.lrc").unlink(missing_ok=True)
-                except Exception:
-                    log.exception("Lyrics unavailable for %s", item["id"])
-                    item["lyrics_warning"] = "Lyrics unavailable; audio is ready."
-            if item["lyrics"]:
-                item["step"], item["progress"] = "timing", 0.0
-                await state.broadcast()
-                try:
-                    item["lyrics"] = await asyncio.to_thread(timed_lyrics, folder, raw, stems.path(folder, "vocals"), item["lyrics"], reporter(state, item, "timing"))
-                    lyrics.line_starts(item["lyrics"])  # cheap, so kept out of the timing cache
-                except Exception:
-                    log.exception("Word timing unavailable for %s", item["id"])
-            item["offset"] = float(meta.get("lyric_offset") or 0)
-            meta.update(duration=item["duration"], artist=item["artist"], title=item["title"])
-            item["number"] = songbook.assign(cache, meta)
-            save_meta(folder, meta)
-            check()
-            item["status"], item["step"], item["progress"] = "ready", None, None
-            state.promote()
-        except Removed:
-            # Undoing the removal puts it back as queued, to be prepared again (fast from cache).
-            log.info("Stopped preparing %s: removed from the queue", item["id"])
-            item["status"], item["step"], item["progress"] = "queued", None, None
-        except Exception as exc:
-            log.exception("Preparation failed for %s", item["id"])
-            item["status"] = "error"
-            missing = missing_tools()
-            # A missing ffmpeg or Node.js surfaces as an obscure "WinError 2"; say what to fix instead.
-            item["error"] = f"{' and '.join(missing)} not found. Install, open a new terminal, restart KTVibes, then Retry." if missing else youtube.explain(exc)
-            state.promote()
-        await state.broadcast()
+        await prepare(state, item, cache, library=library)
