@@ -3,6 +3,7 @@ import csv
 import base64
 import hashlib
 import io
+import json
 import os
 import sqlite3
 import stat
@@ -55,9 +56,10 @@ def open_beneath(root: Path, relative: str):
 
 
 class Library:
-    def __init__(self, path: Path, import_root: Path | None = None):
+    def __init__(self, path: Path, import_root: Path | None = None, share_root: Path | None = None):
         self.path = path
         self.import_root = import_root.resolve() if import_root else None
+        self.share_root = share_root.resolve() if share_root else None
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._migrate()
 
@@ -224,6 +226,50 @@ class Library:
                     existing += 1
         return {"imported": imported, "existing": existing, "skipped": skipped}
 
+    def import_discoveries(self, songs: list[dict]) -> dict:
+        """Add YouTube discoveries without changing an existing candidate's review decision."""
+        imported = existing = skipped = 0
+        records = []
+        seen = set()
+        for song in songs:
+            external_id = str(song.get("id") or "").strip()
+            artist = str(song.get("artist") or "").strip()
+            title = str(song.get("title") or "").strip()
+            if (external_id in seen or len(external_id) != 11 or
+                    not all(char.isalnum() or char in "_-" for char in external_id) or not artist or not title):
+                skipped += 1
+                continue
+            if len(artist) > 200 or len(title) > 300:
+                skipped += 1
+                continue
+            seen.add(external_id)
+            records.append((external_id, artist, title))
+        now = time.time()
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            for external_id, artist, title in records:
+                if self._save_candidate(db, "youtube", external_id, artist, title, "", now):
+                    imported += 1
+                else:
+                    existing += 1
+        return {"imported": imported, "existing": existing, "skipped": skipped}
+
+    def json_setting(self, key: str, default):
+        with self._connect() as db:
+            row = db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        if not row:
+            return default
+        try:
+            return json.loads(row["value"])
+        except (TypeError, ValueError):
+            return default
+
+    def save_json_setting(self, key: str, value):
+        encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        with self._connect() as db:
+            db.execute("INSERT INTO settings(key, value) VALUES (?, ?) "
+                       "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, encoded))
+
     def scan_imports(self) -> dict:
         if self.import_root is None:
             raise ValueError("Set KTVIBES_IMPORT_ROOT before scanning shared media")
@@ -341,13 +387,13 @@ class Library:
                 queued += 1
         return queued
 
-    def reconcile(self, prepared_ids: set[str]):
-        """Match durable processing state to the canonical media cache after startup."""
+    def reconcile(self, published_ids: set[str]):
+        """Match durable processing state to packages verified on the required shared output."""
         now = time.time()
         with self._connect() as db:
             rows = db.execute("SELECT id, external_id, processing_status FROM candidates").fetchall()
             for row in rows:
-                ready = row["external_id"] in prepared_ids
+                ready = row["external_id"] in published_ids
                 if ready:
                     if row["processing_status"] != "ready":
                         db.execute("UPDATE candidates SET processing_status='ready', error=NULL, updated_at=? WHERE id=?", (now, row["id"]))
@@ -402,6 +448,25 @@ class Library:
             db.execute("UPDATE candidates SET processing_status=?, error=?, updated_at=? WHERE id=?",
                        (status, error, now, row["candidate_id"]))
 
+    def publication_failed(self, recording_id: str, error: str):
+        """Make a previously ready candidate retryable when its shared package becomes stale."""
+        with self._connect() as db:
+            db.execute("UPDATE candidates SET processing_status='failed', error=?, updated_at=? "
+                       "WHERE external_id=? AND processing_status='ready'", (error, time.time(), recording_id))
+
+    def publication_succeeded(self, recording_id: str):
+        """Restore a retryable candidate after its updated package publishes successfully."""
+        now = time.time()
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            rows = db.execute("SELECT id FROM candidates WHERE external_id=? AND processing_status IN ('failed','queued') "
+                              "AND NOT EXISTS (SELECT 1 FROM preparation_jobs WHERE candidate_id=candidates.id AND status='running')",
+                              (recording_id,)).fetchall()
+            for row in rows:
+                db.execute("UPDATE candidates SET processing_status='ready', error=NULL, updated_at=? WHERE id=?", (now, row["id"]))
+                db.execute("UPDATE preparation_jobs SET status='ready', stage=NULL, progress=NULL, error=NULL, updated_at=? "
+                           "WHERE candidate_id=? AND status='queued'", (now, row["id"]))
+
     @staticmethod
     def selected_renderer_id(db) -> str:
         row = db.execute("SELECT value FROM settings WHERE key='selected_renderer'").fetchone()
@@ -415,8 +480,7 @@ class Library:
             row = db.execute("SELECT * FROM renderers WHERE id=?", (selected,)).fetchone()
             if row:
                 return dict(row)
-            db.execute("INSERT INTO settings(key, value) VALUES ('selected_renderer','local') ON CONFLICT(key) DO UPDATE SET value='local'")
-            return {"id": "local", "name": "Local machine", "url": None, "machine_id": "local"}
+            raise RuntimeError("Selected renderer is no longer configured; choose a renderer in Backstage")
 
     def renderer(self, renderer_id: str) -> dict:
         if renderer_id == "local":
@@ -470,6 +534,6 @@ class Library:
             if db.execute("SELECT 1 FROM preparation_jobs WHERE renderer_id=? AND status IN ('queued','running')", (renderer_id,)).fetchone():
                 raise ValueError("Wait for this renderer's claimed job to finish")
             if self.selected_renderer_id(db) == renderer_id:
-                db.execute("INSERT INTO settings(key, value) VALUES ('selected_renderer','local') ON CONFLICT(key) DO UPDATE SET value='local'")
+                raise ValueError("Select another renderer before deleting this one")
             if not db.execute("DELETE FROM renderers WHERE id=?", (renderer_id,)).rowcount:
                 raise KeyError("Renderer not found")

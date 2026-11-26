@@ -1,6 +1,7 @@
 """Local and authenticated LAN renderer clients."""
 import hashlib
 import ipaddress
+import json
 import math
 import os
 import re
@@ -11,6 +12,7 @@ from uuid import uuid4
 
 
 MAX_RENDER_SECONDS = 2 * 60 * 60
+REMOTE_RESULT = ".remote-render.json"
 
 
 def normalize_url(value: str) -> str:
@@ -52,18 +54,51 @@ def health(renderer: dict) -> dict:
     data = response.json()
     if data.get("protocol") != 1 or not isinstance(data.get("machine_id"), str):
         raise RuntimeError("Renderer returned an invalid identity")
+    if not isinstance(data.get("ready"), bool) or not isinstance(data.get("capabilities"), list):
+        raise RuntimeError("Renderer returned invalid readiness metadata")
+    if not data["ready"]:
+        missing = data.get("missing_tools") or []
+        detail = f": {', '.join(missing)}" if all(isinstance(name, str) for name in missing) and missing else ""
+        if detail:
+            raise RuntimeError(f"Renderer is missing required tools{detail}")
+        raise RuntimeError(data.get("alignment_error") or "Renderer is not ready")
+    missing_capabilities = {"alignment", "guides"} - set(data["capabilities"])
+    if missing_capabilities:
+        raise RuntimeError(f"Renderer is missing required capabilities: {', '.join(sorted(missing_capabilities))}; update and restart it")
     return data
 
 
-def separate(source: Path, destination: Path, progress, library, renderer_id=None) -> tuple[float, float]:
+def separate(source: Path, destination: Path, progress, library, renderer_id=None) -> tuple[float, float, dict | None]:
     renderer = library.renderer(renderer_id) if library and renderer_id else (library.selected_renderer() if library else {"id": "local"})
     if renderer["id"] == "local":
         from .separate import separate as local_separate
-        return local_separate(source, destination, progress)
+        seconds, gain = local_separate(source, destination, progress)
+        return seconds, gain, None
     return _remote_separate(renderer, source, destination, progress, library)
 
 
-def _remote_separate(renderer: dict, source: Path, destination: Path, progress, library) -> tuple[float, float]:
+def _stem_signature(destination: Path) -> list[list[int]]:
+    return [[(destination / name).stat().st_size, (destination / name).stat().st_mtime_ns]
+            for name in ("vocals.opus", "no_vocals.opus")]
+
+
+def cached_separation(destination: Path) -> tuple[float, float, dict] | None:
+    """Recover metadata committed with remote stems after a controller interruption."""
+    try:
+        data = json.loads((destination / REMOTE_RESULT).read_text(encoding="utf-8"))
+        seconds, gain, end = float(data["seconds"]), float(data["gain"]), data.get("song_end")
+        if data.get("stems") != _stem_signature(destination):
+            return None
+        if not math.isfinite(gain) or not 0 < gain <= 100 or not math.isfinite(seconds) or seconds < 0:
+            return None
+        if end is not None and (not isinstance(end, (int, float)) or not math.isfinite(end) or end <= 0):
+            return None
+        return seconds, gain, {"song_end": end}
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return None
+
+
+def _remote_separate(renderer: dict, source: Path, destination: Path, progress, library) -> tuple[float, float, dict]:
     import httpx
     import soundfile as sf
     started = time.monotonic()
@@ -106,6 +141,9 @@ def _remote_separate(renderer: dict, source: Path, destination: Path, progress, 
                 raise RuntimeError("Renderer returned invalid separation metadata") from exc
             if not math.isfinite(gain) or not 0 < gain <= 100 or not math.isfinite(seconds) or seconds < 0:
                 raise RuntimeError("Renderer returned invalid separation metadata")
+            end = job.get("song_end")
+            if end is not None and (not isinstance(end, (int, float)) or not math.isfinite(end) or end <= 0):
+                raise RuntimeError("Renderer returned invalid song-end metadata")
             manifest = job.get("artifacts") or {}
             temporary = []
             try:
@@ -137,6 +175,14 @@ def _remote_separate(renderer: dict, source: Path, destination: Path, progress, 
                 marker.touch()
                 for source_path, target in temporary:
                     source_path.replace(target)
+                receipt = destination / REMOTE_RESULT
+                receipt_tmp = destination / f"{REMOTE_RESULT}.{uuid4().hex}.tmp"
+                try:
+                    receipt_tmp.write_text(json.dumps({"seconds": seconds, "gain": gain, "song_end": end,
+                                                       "stems": _stem_signature(destination)}), encoding="utf-8")
+                    receipt_tmp.replace(receipt)
+                finally:
+                    receipt_tmp.unlink(missing_ok=True)
                 marker.unlink()
             finally:
                 for source_path, _ in temporary:
@@ -146,4 +192,64 @@ def _remote_separate(renderer: dict, source: Path, destination: Path, progress, 
                 client.delete(f"{renderer['url']}/v1/jobs/{job_id}", headers=_headers())
             except Exception:
                 pass
-        return seconds or time.monotonic() - started, gain
+        return seconds or time.monotonic() - started, gain, {"song_end": end}
+
+
+def align(vocals: Path, lines: list[dict], progress, library, renderer_id=None) -> dict:
+    """Run full-audio lyric analysis on the selected remote CUDA renderer."""
+    import httpx
+
+    renderer = library.renderer(renderer_id) if renderer_id else library.selected_renderer()
+    if renderer["id"] == "local":
+        raise RuntimeError("Remote alignment requires a selected GPU renderer")
+    with httpx.Client(timeout=httpx.Timeout(60, read=900), follow_redirects=False) as client:
+        health_data = health(renderer)
+        identity = health_data["machine_id"]
+        capabilities = health_data.get("capabilities", [])
+        if "alignment" not in capabilities:
+            raise RuntimeError("Renderer does not support lyric alignment; update and restart the renderer")
+        library.renderer_seen(renderer["id"], identity)
+        headers = {**_headers(), "Content-Type": "audio/ogg", "X-KTVibes-Job-Type": "alignment"}
+        with vocals.open("rb") as audio:
+            response = client.post(renderer["url"] + "/v1/jobs", headers=headers, content=audio)
+        response.raise_for_status()
+        job_id = response.json().get("id")
+        if not isinstance(job_id, str) or not re.fullmatch(r"[0-9a-f]{32}", job_id):
+            raise RuntimeError("Renderer returned an invalid alignment job ID")
+        try:
+            if progress:
+                progress(0.0)
+            response = client.post(f"{renderer['url']}/v1/jobs/{job_id}/alignment", headers=_headers(), json={"lines": lines})
+            response.raise_for_status()
+            result = response.json()
+            if result.get("protocol") != 1 or result.get("machine_id") != identity:
+                raise RuntimeError("Renderer returned invalid alignment metadata")
+            if not isinstance(result.get("aligned"), bool) or not isinstance(result.get("lines"), list):
+                raise RuntimeError("Renderer returned invalid aligned lyrics")
+            if progress:
+                progress(1.0)
+            return result
+        finally:
+            try:
+                client.delete(f"{renderer['url']}/v1/jobs/{job_id}", headers=_headers())
+            except Exception:
+                pass
+
+
+def add_guides(lines: list[dict], library, renderer_id=None) -> list[dict]:
+    """Generate pronunciation guides on the pinned renderer for a cached alignment."""
+    import httpx
+
+    renderer = library.renderer(renderer_id) if renderer_id else library.selected_renderer()
+    if renderer["id"] == "local":
+        raise RuntimeError("Remote guide generation requires a selected renderer")
+    health_data = health(renderer)
+    identity = health_data["machine_id"]
+    library.renderer_seen(renderer["id"], identity)
+    response = httpx.post(renderer["url"] + "/v1/guides", headers=_headers(), json={"lines": lines},
+                          timeout=300, follow_redirects=False)
+    response.raise_for_status()
+    result = response.json()
+    if result.get("protocol") != 1 or result.get("machine_id") != identity or not isinstance(result.get("lines"), list):
+        raise RuntimeError("Renderer returned invalid pronunciation guides")
+    return result["lines"]

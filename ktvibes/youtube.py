@@ -18,6 +18,7 @@ def suggest(query: str) -> list[str]:
         return [s for s in json.loads(response.read().decode("utf-8", "replace"))[1] if isinstance(s, str) and not NOT_MUSIC.search(s)][:8]
 
 def parse_title(title: str, channel: str = "") -> dict:
+    title = re.sub(r"\s*[【\[](?:live|ライブ)[】\]].*$", "", title, flags=re.I)
     clean = re.sub(r"\s*[\[(（【][^\])）】]*(?:official|music video|lyrics?|mv|audio|4k|hd|hq|remaster(?:ed)?|官方|歌詞|歌词|뮤직비디오)[^\])）】]*[\])）】]", "", title, flags=re.I).strip()
     clean = re.sub(r"[\U0001F000-\U0001FAFF\u2600-\u27BF\uFE0F]", "", clean).strip()  # emoji: "(Lyrics) 🎵"
     clean = re.sub(r"\s*(?:[-–—|｜]|//)?\s*(?:official\s+)?(?:music\s+video|mv|lyric video|lyrics?)\s*$", "", clean, flags=re.I).strip()
@@ -54,7 +55,35 @@ def search(query: str, page: int = 0, size: int = 10) -> list[dict]:
     return [{"id": e["id"], "title": e.get("title", "Untitled"), "channel": e.get("channel") or e.get("uploader", ""),
              "duration": e.get("duration"), "thumbnail": f'https://i.ytimg.com/vi/{e["id"]}/mqdefault.jpg',
              "parsed": parse_title(e.get("title", ""), e.get("channel") or e.get("uploader", ""))}
-            for e in result.get("entries", []) if e and ID.fullmatch(e.get("id", "")) and is_music(e.get("title", ""), e.get("duration"))]
+             for e in result.get("entries", []) if e and ID.fullmatch(e.get("id", "")) and is_music(e.get("title", ""), e.get("duration"))]
+
+def normalize_channel_url(value: str) -> str:
+    parsed = urllib.parse.urlsplit(value.strip())
+    host = (parsed.hostname or "").lower()
+    path = parsed.path.rstrip("/")
+    if (parsed.scheme not in ("http", "https") or host not in ("youtube.com", "www.youtube.com", "m.youtube.com") or
+            parsed.username or parsed.password or parsed.query or parsed.fragment or
+            not re.fullmatch(r"/(?:@[A-Za-z0-9._-]+|channel/[A-Za-z0-9_-]+|c/[^/]+|user/[^/]+)(?:/videos)?", path)):
+        raise ValueError("Use a YouTube channel URL such as https://www.youtube.com/@artist")
+    if path.endswith("/videos"):
+        path = path[:-7]
+    return f"https://www.youtube.com{path}"
+
+def channel_videos(url: str, page: int = 0, size: int = 10) -> list[dict]:
+    """Recent plausible songs from one YouTube channel."""
+    import yt_dlp
+    url = normalize_channel_url(url)
+    first, last = page * size + 1, (page + 1) * size
+    with yt_dlp.YoutubeDL({**base_options(), "extract_flat": True, "quiet": True, "noprogress": True,
+                           "skip_download": True, "socket_timeout": 20, "playlist_items": f"{first}-{last}"}) as ydl:
+        result = ydl.extract_info(url + "/videos", download=False)
+    channel = result.get("channel") or result.get("uploader") or re.sub(r"\s+-\s+Videos$", "", result.get("title") or "")
+    return [{"id": entry["id"], "title": entry.get("title", "Untitled"),
+             "channel": entry.get("channel") or entry.get("uploader") or channel,
+             "duration": entry.get("duration"), "thumbnail": f'https://i.ytimg.com/vi/{entry["id"]}/mqdefault.jpg',
+             "parsed": parse_title(entry.get("title", ""), entry.get("channel") or entry.get("uploader") or channel)}
+            for entry in result.get("entries", [])
+            if entry and ID.fullmatch(entry.get("id", "")) and is_music(entry.get("title", ""), entry.get("duration"))]
 
 def _extract(options: dict, video_id: str, progress=None, attempts: int = 4) -> dict:
     """Download with fresh stream URLs on HTTP 403, which YouTube returns intermittently.

@@ -154,3 +154,10 @@ def add_hangul(lines: list[dict]) -> list[dict]:
                 reading = ""
             put(unit, 4, reading)
     return lines
+
+
+def add_all(lines: list[dict]) -> list[dict]:
+    """Generate every pronunciation-guide slot for fully timed lyric units."""
+    from . import lyrics
+    return lyrics.add_kana(lyrics.add_jyutping(add_hangul(lyrics.add_korean_romanization(
+        lyrics.add_pinyin(lyrics.add_romaji(lines))))))

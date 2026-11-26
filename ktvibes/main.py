@@ -18,7 +18,7 @@ from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 from .queue import State
-from . import curator, lyrics, renderers, songbook, stems, worker, youtube
+from . import curator, discovery, exports, lyrics, renderers, songbook, stems, worker, youtube
 from .library import Library
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -26,30 +26,68 @@ CACHE = Path(os.environ.get("KTVIBES_CACHE", ROOT / "cache"))
 PORT = int(os.environ.get("KTVIBES_PORT", 8765))
 state = State()
 catalog = None
+publication_tasks = {}
 RECORDING_ID = re.compile(r"(?:[A-Za-z0-9_-]{11}|local_[A-Za-z0-9_-]{16})")
+
+def share_root() -> Path | None:
+    configured = os.environ.get("KTVIBES_SHARE_ROOT")
+    if configured and Path(configured).expanduser().resolve() != exports.REQUIRED_ROOT:
+        raise RuntimeError(f"KTVIBES_SHARE_ROOT must be {exports.REQUIRED_ROOT}")
+    # Keep the expected path even while disconnected so a later retry can use a remounted share.
+    return exports.REQUIRED_ROOT
 
 def import_root() -> Path | None:
     configured = os.environ.get("KTVIBES_IMPORT_ROOT")
     if configured:
         return Path(configured).expanduser()
-    shared = Path("/Volumes/Karaoke Shared/incoming")
-    return shared if shared.is_dir() else None
+    shared = share_root()
+    incoming = shared / "incoming" if shared else None
+    return incoming if incoming and incoming.is_dir() else None
+
+
+def schedule_publication(recording_id: str):
+    """Debounce metadata-only updates so repeated lyric nudges produce one shared package."""
+    if previous := publication_tasks.get(recording_id):
+        previous.cancel()
+    async def publish_later():
+        try:
+            await asyncio.sleep(1)
+            if catalog is None or not catalog.share_root:
+                raise RuntimeError("Windows share is unavailable")
+            await asyncio.to_thread(exports.publish, CACHE / recording_id, catalog.share_root)
+            await asyncio.to_thread(catalog.publication_succeeded, recording_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if catalog is not None:
+                await asyncio.to_thread(catalog.publication_failed, recording_id, str(exc))
+        finally:
+            if publication_tasks.get(recording_id) is asyncio.current_task():
+                publication_tasks.pop(recording_id, None)
+    publication_tasks[recording_id] = asyncio.create_task(publish_later())
 
 @asynccontextmanager
 async def lifespan(app):
     global catalog
     CACHE.mkdir(parents=True, exist_ok=True)
-    catalog = Library(CACHE / "library.sqlite3", import_root())
+    catalog = Library(CACHE / "library.sqlite3", import_root(), share_root())
+    state.meta_changed = schedule_publication
     state.build = build()
     await asyncio.to_thread(songbook.backfill, CACHE, stems.prepared)  # caches from before the songbook
     prepared = prepared_songs()
-    await asyncio.to_thread(catalog.reconcile, set(prepared))
+    published = await asyncio.to_thread(exports.reconcile, CACHE, catalog.share_root)
+    await asyncio.to_thread(catalog.reconcile, published)
     state.restore(CACHE / "queue.json", seed=lambda: {id: meta["prepared"] for id, meta in prepared.items()})
     tasks = [asyncio.create_task(worker.run(state, CACHE, catalog)),
-             asyncio.create_task(curator.run(state, CACHE, catalog))]
+              asyncio.create_task(curator.run(state, CACHE, catalog)),
+              asyncio.create_task(discovery_loop(catalog))]
     try:
         yield
     finally:
+        for task in publication_tasks.values():
+            task.cancel()
+        await asyncio.gather(*publication_tasks.values(), return_exceptions=True)
+        publication_tasks.clear()
         for task in tasks:
             task.cancel()
         for task in tasks:
@@ -74,7 +112,7 @@ async def revalidate_static(request, call_next):
     # Pages load plain JS/CSS without a build step; revalidate so edits show up on reload.
     # Media too: a song's tracks keep their URL when converted to a new format or prepared again.
     response = await call_next(request)
-    if request.url.path.startswith(("/static/", "/media/")) or request.url.path in ("/", "/tv", "/remote"):
+    if request.url.path.startswith(("/static/", "/media/")) or request.url.path in ("/", "/tv", "/remote", "/owner"):
         response.headers["Cache-Control"] = "no-cache"
     return response
 
@@ -167,6 +205,68 @@ class RendererInput(BaseModel):
 class RendererChoice(BaseModel):
     id: str = Field(min_length=1, max_length=100)
 
+class DiscoverySettings(BaseModel):
+    enabled: bool = False
+    interval_hours: int = Field(default=24, ge=1, le=168)
+    results_per_source: int = Field(default=10, ge=1, le=25)
+    search_terms: list[str] = Field(default_factory=list, max_length=20)
+    channels: list[str] = Field(default_factory=list, max_length=20)
+
+    @field_validator("search_terms")
+    @classmethod
+    def clean_search_terms(cls, values):
+        cleaned = []
+        for value in values:
+            term = value.strip()
+            if not term or len(term) > 200:
+                raise ValueError("Search terms must be 1-200 characters")
+            if term.casefold() not in {known.casefold() for known in cleaned}:
+                cleaned.append(term)
+        return cleaned
+
+    @field_validator("channels")
+    @classmethod
+    def clean_channels(cls, values):
+        return list(dict.fromkeys(youtube.normalize_channel_url(value) for value in values))
+
+async def run_discovery(library: Library) -> dict:
+    result = await asyncio.to_thread(discovery.run, library)
+    published = await asyncio.to_thread(exports.reconcile, CACHE, library.share_root)
+    await asyncio.to_thread(library.reconcile, published)
+    return result
+
+async def discovery_loop(library: Library):
+    while True:
+        if await asyncio.to_thread(discovery.due, library):
+            try:
+                await run_discovery(library)
+            except Exception:
+                pass  # Status is persisted for Backstage; a later interval retries it.
+        await asyncio.sleep(60)
+
+@app.get("/api/owner/discovery")
+async def owner_discovery(request: Request):
+    library = owner_store(request)
+    return {"settings": await asyncio.to_thread(discovery.settings, library),
+            "status": await asyncio.to_thread(discovery.status, library)}
+
+@app.put("/api/owner/discovery")
+async def owner_save_discovery(value: DiscoverySettings, request: Request):
+    library = owner_store(request)
+    saved = await asyncio.to_thread(discovery.save_settings, library, value.model_dump())
+    return {"settings": saved, "status": await asyncio.to_thread(discovery.status, library)}
+
+@app.post("/api/owner/discovery/run")
+async def owner_run_discovery(request: Request):
+    library = owner_store(request)
+    try:
+        result = await run_discovery(library)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(502, f"YouTube discovery failed: {youtube.explain(exc)}") from exc
+    return {"result": result, "status": await asyncio.to_thread(discovery.status, library)}
+
 @app.get("/api/owner/candidates")
 async def owner_candidates(request: Request, status: Literal["pending", "approved", "rejected", "deferred"] | None = None):
     library = owner_store(request)
@@ -185,9 +285,14 @@ async def owner_import_folder_status(request: Request):
     library = owner_store(request)
     if library.import_root is None and (detected := import_root()) is not None:
         library.import_root = detected.resolve()
+    if library.share_root is None and (detected := share_root()) is not None:
+        library.share_root = detected.resolve()
     root = library.import_root
+    shared = library.share_root
     return {"configured": root is not None, "available": bool(root and root.is_dir()),
-            "root": str(root) if root else None}
+            "root": str(root) if root else None, "share_root": str(shared) if shared else None,
+            "output": str(shared / "imported") if shared else None,
+            "output_available": bool(shared and exports.available(shared))}
 
 @app.post("/api/owner/import-folder", status_code=201)
 async def owner_scan_import_folder(request: Request):
@@ -377,7 +482,8 @@ async def choose_lyrics(video_id: str, choice: LyricChoice):
     if state.current and state.current["id"] == video_id:
         # The song on stage switches right away: time the new lines, then resend lyrics to the TV.
         lines = lyrics.parse_lrc(chosen["syncedLyrics"])
-        lines = await asyncio.to_thread(worker.timed_lyrics, folder, chosen["syncedLyrics"], stems.path(folder, "vocals"), lines)
+        lines = await asyncio.to_thread(worker.timed_lyrics, folder, chosen["syncedLyrics"], stems.path(folder, "vocals"), lines,
+                                        library=catalog)
         lyrics.line_starts(lines)
         if state.current and state.current["id"] == video_id:
             state.current.update(lyrics=lines, lyrics_rev=state.current.get("lyrics_rev", 0) + 1)
@@ -388,6 +494,17 @@ async def choose_lyrics(video_id: str, choice: LyricChoice):
     meta["lyrics_identity"] = [meta["artist"], meta["title"]]
     meta.pop("lyric_offset", None)  # a nudge for other lyrics no longer fits
     worker.save_meta(folder, meta)
+    if catalog is not None and stems.prepared(folder):
+        if not catalog.share_root:
+            error = "Windows share is unavailable; the updated package was not published"
+            await asyncio.to_thread(catalog.publication_failed, video_id, error)
+            raise HTTPException(503, error)
+        try:
+            await asyncio.to_thread(exports.publish, folder, catalog.share_root)
+            await asyncio.to_thread(catalog.publication_succeeded, video_id)
+        except Exception as exc:
+            await asyncio.to_thread(catalog.publication_failed, video_id, str(exc))
+            raise HTTPException(502, f"Could not publish the updated package: {exc}") from exc
     return {"saved": choice.id}
 
 @app.delete("/api/songs/{video_id}")
@@ -404,7 +521,8 @@ async def delete_song(video_id: str):
     elif folder.is_dir():
         await asyncio.to_thread(shutil.rmtree, folder)
     if catalog is not None:
-        await asyncio.to_thread(catalog.reconcile, set(prepared_songs()))
+        published = await asyncio.to_thread(exports.reconcile, CACHE, catalog.share_root)
+        await asyncio.to_thread(catalog.reconcile, published)
     await state.broadcast()
     return {"deleted": video_id}
 

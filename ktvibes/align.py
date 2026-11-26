@@ -39,8 +39,9 @@ def _load():
         import torch
         from torchaudio.pipelines import MMS_FA
         _bundle = MMS_FA
-        # Apple's GPU runs the speech model about twice as fast as the CPU, with the same timings.
-        device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+        # MMS alignment uses many differently sized clips. PyTorch's MPS backend retains their
+        # compiled graphs until this long-lived process exhausts unified memory, so Macs use CPU.
+        device = "cuda" if torch.cuda.is_available() else "cpu"
         _model = MMS_FA.get_model().to(device).eval()
     return _bundle, _model
 

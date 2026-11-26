@@ -25,19 +25,32 @@
       </form>
     </section>
 
+    <section class="panel discovery-panel">
+      <div class="section-head"><div><span class="kicker">02 / DISCOVER</span><h2>YouTube watchlist</h2></div><span id="discovery-summary" class="summary">Loading...</span></div>
+      <form id="discovery-form" class="discovery-form">
+        <label class="discovery-toggle"><input id="discovery-enabled" type="checkbox"> Run automatically</label>
+        <label>Search terms<textarea id="discovery-terms" rows="4" placeholder="Ado&#10;Hatsune Miku"></textarea><small>One term per line. Each run checks newest results and advances through older pages.</small></label>
+        <label>Preferred channels<textarea id="discovery-channels" rows="4" placeholder="https://www.youtube.com/@artist"></textarea><small>One YouTube channel URL per line.</small></label>
+        <label>Every (hours)<input id="discovery-interval" type="number" min="1" max="168" required></label>
+        <label>Results per source<input id="discovery-limit" type="number" min="1" max="25" required></label>
+        <div class="discovery-actions"><button type="submit">Save watchlist</button><button id="run-discovery" type="button" class="quiet">Run discovery now</button></div>
+        <small id="discovery-status" class="discovery-status">No discovery run yet.</small>
+      </form>
+    </section>
+
     <section class="panel renderer-panel">
-      <div class="section-head"><div><span class="kicker">02 / COMPUTE</span><h2>Render machine</h2></div><span id="renderer-summary" class="summary">Loading...</span></div>
+      <div class="section-head"><div><span class="kicker">03 / COMPUTE</span><h2>Render machine</h2></div><span id="renderer-summary" class="summary">Loading...</span></div>
       <div id="renderers" class="renderer-list"></div>
       <form id="renderer-form" class="renderer-form">
         <input id="renderer-name" maxlength="100" placeholder="Machine name" aria-label="Machine name" required>
         <input id="renderer-url" maxlength="300" placeholder="http://192.168.1.42:8790" aria-label="Renderer URL" required>
         <button>Add machine</button>
       </form>
-      <p class="note">Only literal private LAN or Tailscale IP addresses are accepted. Configure the same <code>KTVIBES_RENDERER_TOKEN</code> on both machines.</p>
+      <p class="note"><b>Check</b> only tests a machine; click <b>Use</b> to select it for separation and lyric timing. Only literal private LAN or Tailscale IP addresses are accepted. Configure the same <code>KTVIBES_RENDERER_TOKEN</code> on both machines.</p>
     </section>
 
     <section class="panel catalog-panel">
-      <div class="section-head"><div><span class="kicker">03 / CURATE</span><h2>Candidate songs</h2></div><span id="candidate-count" class="summary"></span></div>
+      <div class="section-head"><div><span class="kicker">04 / CURATE</span><h2>Candidate songs</h2></div><span id="candidate-count" class="summary"></span></div>
       <div class="toolbar">
         <div id="filters" class="filters" role="group" aria-label="Review status">
           <button data-status="pending" class="active">Pending</button><button data-status="approved">Approved</button><button data-status="deferred">Deferred</button><button data-status="rejected">Rejected</button>
@@ -49,7 +62,7 @@
     </section>
 
     <section class="panel jobs-panel">
-      <div class="section-head"><div><span class="kicker">04 / OUTPUT</span><h2>Preparation jobs</h2></div><button id="refresh-jobs" class="quiet">Refresh</button></div>
+      <div class="section-head"><div><span class="kicker">05 / OUTPUT</span><h2>Preparation jobs</h2></div><button id="refresh-jobs" class="quiet">Refresh</button></div>
       <div id="jobs" class="jobs"></div>
     </section>
   </main>

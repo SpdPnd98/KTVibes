@@ -63,6 +63,7 @@ class State:
         self.saved_at = 0.0
         self.build = ""  # fingerprint of the web app files; open pages reload when it changes
         self.lyrics_sent = {}  # TV socket -> key of the song whose lyrics it already has
+        self.meta_changed = None  # controller callback for republishing persistent song metadata
 
     def guides(self):
         """Guide modes with something to show for the current song (all of them when idle)."""
@@ -199,6 +200,8 @@ class State:
             temporary = meta_path.with_suffix(".tmp")
             temporary.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
             temporary.replace(meta_path)
+            if self.meta_changed:
+                self.meta_changed(self.current["id"])
         except (OSError, ValueError):
             pass
 

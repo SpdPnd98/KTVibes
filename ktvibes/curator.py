@@ -6,7 +6,7 @@ from .queue import State
 from . import worker
 
 
-ACTIVE = {"queued", "downloading", "separating", "syncing"}
+ACTIVE = {"queued", "downloading", "separating", "syncing", "publishing"}
 log = logging.getLogger(__name__)
 
 

@@ -6,7 +6,7 @@ Python 3.12 is pinned; `uv` installs it when needed. PyTorch and torchaudio 2.7.
 
 ### macOS (Apple Silicon)
 
-No NVIDIA driver is needed. On macOS, `uv sync` installs the standard PyTorch 2.7.1 wheels, and Demucs runs on the Mac GPU (MPS); forced alignment runs on the CPU. Other machines without CUDA fall back to the CPU for both. Install the tools with `brew install uv ffmpeg`, then:
+No NVIDIA driver is needed for local rendering. On macOS, `uv sync` installs the standard PyTorch 2.7.1 wheels; Demucs runs on MPS and forced alignment runs on the CPU. When a separate renderer is selected, both models and the full-audio analysis run there instead, and renderer failures do not fall back to the Mac. Install the tools with `brew install uv ffmpeg`, then:
 
 ```bash
 uv sync

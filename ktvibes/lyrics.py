@@ -194,7 +194,15 @@ VOWELS = "a ae ya yae eo e yeo ye o wa wae oe yo u wo we wi yu eu ui i".split()
 FINALS = ["", "k", "k", "k", "n", "n", "n", "t", "l", "k", "m", "l", "l", "l", "p", "l", "m", "p", "p", "t", "t", "ng", "t", "t", "k", "t", "p", "t"]
 @functools.cache
 def g2p():
+    # g2pk2 expects NLTK's separately downloaded corpus even though cmudict is a dependency.
+    # Substitute the packaged dictionary so an offline renderer never downloads data at runtime.
     from g2pk2 import G2p  # slow to start, so only when a line has Korean to read
+    try:
+        from g2pk2 import g2pk2 as module
+    except ImportError:  # permits lightweight substitutes used by embedders and tests
+        return G2p()
+    import cmudict
+    module.cmudict = cmudict
     return G2p()
 
 def needs_reading(unit: list) -> bool:

@@ -1,10 +1,11 @@
 import asyncio
+import json
 import shutil
 import subprocess
 import tempfile
 import threading
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from pathlib import Path
 
 from ktvibes.library import Library
@@ -30,6 +31,18 @@ class LibraryTests(unittest.TestCase):
         self.assertEqual(self.library.import_csv(CSV), {"imported": 0, "existing": 2, "skipped": 0})
         again = {item["id"]: item for item in Library(self.path).candidates()}
         self.assertEqual(again[song["id"]]["review_status"], "approved")
+
+    def test_discovery_import_deduplicates_and_preserves_review_state(self):
+        songs = [{"id": "abcdefghijk", "artist": "Ado", "title": "One"},
+                 {"id": "abcdefghijk", "artist": "Ado", "title": "Duplicate"},
+                 {"id": "bad", "artist": "Ado", "title": "Invalid"}]
+        self.assertEqual(self.library.import_discoveries(songs), {"imported": 1, "existing": 0, "skipped": 2})
+        candidate = self.library.candidates()[0]
+        self.library.review([candidate["id"]], "approved")
+        self.assertEqual(self.library.import_discoveries([{"id": "abcdefghijk", "artist": "Ado", "title": "Updated"}]),
+                         {"imported": 0, "existing": 1, "skipped": 0})
+        updated = self.library.candidate(candidate["id"])
+        self.assertEqual((updated["title"], updated["review_status"]), ("Updated", "approved"))
 
     def test_unapproved_song_cannot_prepare_and_withdrawn_approval_cancels(self):
         self.library.import_csv(CSV)
@@ -101,6 +114,18 @@ class LibraryTests(unittest.TestCase):
         self.assertEqual(recovered.jobs()[0]["status"], "ready")
         self.assertIsNone(recovered.claim_job())
 
+    def test_publication_failure_makes_a_ready_candidate_retryable(self):
+        self.library.import_csv(CSV)
+        song = self.library.candidates()[0]
+        self.library.review([song["id"]], "approved")
+        self.library.reconcile({song["external_id"]})
+        self.library.publication_failed(song["external_id"], "share offline")
+        self.assertEqual(self.library.candidate(song["id"])["processing_status"], "failed")
+        self.assertEqual(self.library.enqueue([song["id"]]), 1)
+        self.library.publication_succeeded(song["external_id"])
+        self.assertEqual(self.library.candidate(song["id"])["processing_status"], "ready")
+        self.assertEqual(self.library.jobs()[0]["status"], "ready")
+
     def test_renderer_selection_persists(self):
         saved = self.library.add_renderer("gpu", "GPU desktop", "http://192.168.1.42:8790")
         self.assertEqual(saved["name"], "GPU desktop")
@@ -109,6 +134,9 @@ class LibraryTests(unittest.TestCase):
             self.library.renderer_seen("gpu", "machine-b")
         self.library.select_renderer("gpu")
         self.assertEqual(Library(self.path).selected_renderer()["id"], "gpu")
+        with self.assertRaisesRegex(ValueError, "Select another renderer"):
+            self.library.delete_renderer("gpu")
+        self.library.select_renderer("local")
         self.library.delete_renderer("gpu")
         self.assertEqual(self.library.selected_renderer()["id"], "local")
 
@@ -141,6 +169,66 @@ class RendererURLTests(unittest.TestCase):
             with self.subTest(url=url), self.assertRaises(ValueError):
                 normalize_url(url)
 
+    def test_health_rejects_renderer_missing_required_tools(self):
+        from ktvibes import renderers
+        response = Mock()
+        response.json.return_value = {"protocol": 1, "machine_id": "gpu", "ready": False,
+                                      "missing_tools": ["ffprobe"], "capabilities": ["separation", "alignment", "guides"]}
+        with patch("httpx.get", return_value=response), self.assertRaisesRegex(RuntimeError, "ffprobe"):
+            renderers.health({"id": "gpu", "url": "http://192.168.1.42:8790"})
+
+    def test_health_rejects_renderer_without_remote_alignment(self):
+        from ktvibes import renderers
+        response = Mock()
+        response.json.return_value = {"protocol": 1, "machine_id": "gpu", "ready": True, "capabilities": ["separation"]}
+        with patch("httpx.get", return_value=response), self.assertRaisesRegex(RuntimeError, "update and restart"):
+            renderers.health({"id": "gpu", "url": "http://192.168.1.42:8790"})
+
+    def test_health_rejects_malformed_readiness(self):
+        from ktvibes import renderers
+        response = Mock()
+        response.json.return_value = {"protocol": 1, "machine_id": "gpu", "capabilities": ["alignment"]}
+        with patch("httpx.get", return_value=response), self.assertRaisesRegex(RuntimeError, "readiness metadata"):
+            renderers.health({"id": "gpu", "url": "http://192.168.1.42:8790"})
+
+
+class DiscoveryTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.library = Library(Path(self.temp.name) / "library.sqlite3")
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_channel_url_normalization(self):
+        from ktvibes.youtube import normalize_channel_url
+        self.assertEqual(normalize_channel_url("https://www.youtube.com/@ChaR_tarako/videos"),
+                         "https://www.youtube.com/@ChaR_tarako")
+        with self.assertRaises(ValueError):
+            normalize_channel_url("https://example.com/@ChaR_tarako")
+
+    def test_discovery_collects_sources_and_persists_status(self):
+        from ktvibes import discovery
+        discovery.save_settings(self.library, {"enabled": True, "interval_hours": 24, "results_per_source": 5,
+                                               "search_terms": ["Ado"],
+                                               "channels": ["https://www.youtube.com/@ChaR_tarako"]})
+        searched = {"id": "abcdefghijk", "channel": "", "parsed": {"artist": "", "title": "Song"}}
+        channel = {"id": "bbbbbbbbbbb", "channel": "Cha'R", "parsed": {"artist": "Cha'R", "title": "Glow"}}
+        with patch.object(discovery.youtube, "search", return_value=[searched]) as search, \
+                patch.object(discovery.youtube, "channel_videos", return_value=[channel]) as channel_videos:
+            result = discovery.run(self.library)
+        self.assertEqual((result["imported"], result["found"], result["sources"]), (2, 2, 2))
+        self.assertEqual([call.kwargs["page"] for call in search.call_args_list], [0, 1])
+        self.assertEqual([call.kwargs["page"] for call in channel_videos.call_args_list], [0, 1])
+        with patch.object(discovery.youtube, "search", return_value=[searched]) as search, \
+                patch.object(discovery.youtube, "channel_videos", return_value=[channel]) as channel_videos:
+            discovery.run(self.library)
+        self.assertEqual([call.kwargs["page"] for call in search.call_args_list], [0, 2])
+        self.assertEqual([call.kwargs["page"] for call in channel_videos.call_args_list], [0, 2])
+        self.assertEqual({song["artist"] for song in self.library.candidates()}, {"Ado", "Cha'R"})
+        self.assertEqual(discovery.status(self.library)["state"], "idle")
+        self.assertFalse(discovery.due(self.library))
+
 
 class PreparationLockTests(unittest.IsolatedAsyncioTestCase):
     async def test_same_recording_is_prepared_once_at_a_time(self):
@@ -169,6 +257,19 @@ class StemPublicationTests(unittest.TestCase):
             (folder / ".stems-incomplete").touch()
             self.assertFalse(stems.ready(folder))
             self.assertFalse(stems.prepared(folder))
+
+    def test_remote_stem_receipt_recovers_metadata_only_for_matching_stems(self):
+        from ktvibes import renderers
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            (folder / 'vocals.opus').write_bytes(b'vocals')
+            (folder / 'no_vocals.opus').write_bytes(b'music')
+            receipt = {'seconds': 12.5, 'gain': 1.25, 'song_end': 198.0,
+                       'stems': renderers._stem_signature(folder)}
+            (folder / renderers.REMOTE_RESULT).write_text(json.dumps(receipt), encoding='utf-8')
+            self.assertEqual(renderers.cached_separation(folder), (12.5, 1.25, {'song_end': 198.0}))
+            (folder / 'vocals.opus').write_bytes(b'changed')
+            self.assertIsNone(renderers.cached_separation(folder))
 
 
 class SharedImportTests(unittest.TestCase):

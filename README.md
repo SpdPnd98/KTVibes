@@ -87,7 +87,11 @@ The first song starts as soon as it is ready. Later songs are prepared while ear
 
 Open `http://localhost:8765/owner` on the KTVibes machine. To use Backstage from another device, set `KTVIBES_OWNER_TOKEN` before starting KTVibes and enter that token on the page.
 
+The YouTube watchlist discovers candidates from editable search terms and preferred channel URLs. Choose an interval, save the watchlist, or run it immediately. Every run checks the newest results and advances a persistent cursor through older catalog pages, wrapping around after the backlog has been covered. Discovery stores links and metadata only: matches enter **Pending** review and are not downloaded until approved and prepared. Existing review decisions are preserved when a later crawl finds the same video again.
+
 For shared M4A files, put tracks in the configured import folder using `Artist - Title.m4a` names, then choose **Scan shared M4As** in Backstage. On this custom macOS setup, `/Volumes/Karaoke Shared/incoming` is detected automatically when mounted. Files remain on the share; KTVibes verifies and copies each source into its local cache before processing. Local tracks have no music video unless one is added separately.
+
+Every completed song is also published to `/Volumes/Karaoke Shared/imported/<recording-id>/`. The package contains the source audio, both generated stems, metadata, timed lyrics and video when available. `manifest.json` records SHA-256 checksums, and a matching manifest is written under `manifests/`. Publication uses a temporary directory and same-share rename, retains the previous package until the external manifest and checksums validate, and only then marks preparation ready. Publication errors are recorded under `failed/`; retrying preparation reuses the local cache and retries publication.
 
 For another mount, set the folder before starting KTVibes:
 
@@ -123,7 +127,7 @@ export KTVIBES_RENDERER_TOKEN='replace-with-a-long-random-value'
 uv run ktvibes-renderer
 ```
 
-Start the main KTVibes server with the same `KTVIBES_RENDERER_TOKEN`. In Backstage, add the GPU machine as `http://<private-ip>:8790`, check its health, and select it. The karaoke machine still downloads and stores media; only Demucs separation is sent to the GPU machine. If that machine is unavailable, the job fails visibly and can be prepared again after the connection is restored. Already-prepared songs continue to play.
+Start the main KTVibes server with the same `KTVIBES_RENDERER_TOKEN`. In Backstage, add the GPU machine as `http://<private-ip>:8790`, check its health, and select it. The karaoke machine downloads, stores, serves, and publishes media; Demucs separation, full-audio end detection, vocal-energy analysis, and MMS lyric alignment run on the GPU machine. It does not silently fall back to local models: if the renderer is unavailable or outdated, the job fails visibly and can be prepared again after the connection is restored. Already-prepared songs continue to play.
 
 Use this plain-HTTP mode only on a trusted wired LAN or an encrypted private network such as Tailscale/WireGuard. The token and song audio are not protected from network inspection by HTTP. A reverse proxy with HTTPS can be used when the private network is not trusted.
 
@@ -171,6 +175,7 @@ This pulls the latest version; the next `ktvibes` installs any new dependencies.
 | `KTVIBES_VIDEO_HEIGHT` | `720` | Highest music video resolution to download, e.g. `1080` (about twice the size) |
 | `KTVIBES_OPEN_BROWSER` | unset | Set to `1` to open the TV page in the default browser when KTVibes starts. The desktop apps do this |
 | `KTVIBES_IMPORT_ROOT` | auto-detected on this Mac | Shared folder containing source M4A files; paths in CSV files are relative to this folder |
+| `KTVIBES_SHARE_ROOT` | `/Volumes/Karaoke Shared` | Optional assertion of the required shared root; any other path is rejected rather than used as local output |
 | `KTVIBES_OWNER_TOKEN` | unset | Token required for Backstage over the network; without it owner APIs accept only local requests |
 | `KTVIBES_RENDERER_TOKEN` | unset | Shared token used between the controller and a render agent |
 | `KTVIBES_RENDERER_PORT` | `8790` | Port used by `ktvibes-renderer` |

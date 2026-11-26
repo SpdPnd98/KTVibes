@@ -2,6 +2,7 @@
 import asyncio
 import hashlib
 import json
+import math
 import os
 import secrets
 import shutil
@@ -17,11 +18,13 @@ from fastapi.responses import FileResponse
 
 ROOT = Path(os.environ.get("KTVIBES_RENDERER_CACHE", Path.home() / ".cache" / "ktvibes-renderer"))
 MAX_SOURCE_BYTES = 500 * 1024 * 1024
+MAX_ALIGNMENT_BYTES = 2 * 1024 * 1024
 jobs = {}
 keys = {}
 tasks = set()
 reservations = set()
 gpu_lock = threading.Lock()
+guide_lock = threading.Lock()
 state_lock = threading.RLock()
 
 
@@ -67,6 +70,37 @@ def status(job: dict) -> dict:
         return {key: value for key, value in job.items() if key != "folder"}
 
 
+def run_alignment(job: dict, lines: list[dict]) -> dict:
+    """Decode and time lyrics beside the GPU instead of loading the controller with audio inference."""
+    import soundfile as sf
+    from . import align, guides, lyrics
+
+    with gpu_lock:
+        update_job(job, persist=True, status="running", stage="aligning", progress=0.0)
+        samples, rate = sf.read(job["folder"] / "vocals.opus", dtype="float32")
+        energy = lyrics.envelope(samples, rate)
+        update_job(job, progress=0.1)
+        shift = lyrics.find_shift(lines, energy)
+        if shift:
+            lyrics.shift_lines(lines, shift)
+        sections = lyrics.shift_sections(lines, energy)
+        align.warm()
+        device = next(align._model.parameters()).device
+        if device.type != "cuda":
+            raise RuntimeError(f"CUDA alignment is required; renderer selected {device.type}")
+        aligned = True
+        try:
+            align.align(lines, samples, rate, progress=lambda value: update_job(job, progress=0.1 + 0.8 * float(value)))
+        except Exception:
+            aligned = False
+        lyrics.time_units(lines, energy)
+        guides.add_all(lines)
+        result = {"protocol": 1, "aligned": aligned, "lines": lines, "shift": shift, "sections": sections,
+                  "machine_id": machine_id()}
+        update_job(job, persist=True, status="ready", stage=None, progress=1.0, alignment_complete=True)
+        return result
+
+
 def run_job(job_id: str):
     job = jobs[job_id]
     output = job["folder"] / "output"
@@ -81,8 +115,9 @@ def run_job(job_id: str):
             path = output / name
             digest = hashlib.sha256(path.read_bytes()).hexdigest()
             artifacts[name] = {"sha256": digest, "bytes": path.stat().st_size}
+        from .stems import song_end
         update_job(job, persist=True, status="ready", stage=None, progress=1.0, protocol=1, seconds=seconds, gain=gain,
-                   artifacts=artifacts, machine_id=machine_id(), finished_at=time.time())
+                   song_end=song_end(output), artifacts=artifacts, machine_id=machine_id(), finished_at=time.time())
     except Exception as exc:
         update_job(job, persist=True, status="failed", stage=None, error=str(exc), finished_at=time.time())
 
@@ -107,8 +142,14 @@ def restore_jobs():
             shutil.rmtree(folder, ignore_errors=True)
             continue
         data["folder"] = folder
+        data.setdefault("kind", "separation")
         if data.get("status") in ("running", "queued"):
-            data.update(status="queued", stage="queued", progress=0.0)
+            if data["kind"] == "alignment":
+                data.update(status="failed", stage=None, error="Alignment was interrupted; submit it again",
+                            finished_at=time.time())
+                save_job(data)
+            else:
+                data.update(status="queued", stage="queued", progress=0.0)
         jobs[data["id"]] = data
         if data.get("key"):
             keys[data["key"]] = data["id"]
@@ -144,7 +185,7 @@ async def cleanup_loop():
 async def lifespan(_app):
     restore_jobs()
     for job_id, job in list(jobs.items()):
-        if job["status"] == "queued" and (job["folder"] / "audio.m4a").is_file():
+        if job["kind"] == "separation" and job["status"] == "queued" and (job["folder"] / "audio.m4a").is_file():
             start_job(job_id)
     cleanup = asyncio.create_task(cleanup_loop())
     try:
@@ -162,14 +203,47 @@ app = FastAPI(title="KTVibes Renderer", lifespan=lifespan)
 async def health(request: Request):
     authorize(request)
     from .separate import backend_info
-    return {"protocol": 1, "machine_id": machine_id(), **backend_info(), "busy": gpu_lock.locked(),
+    missing_tools = [name for name in ("ffmpeg", "ffprobe") if not shutil.which(name)]
+    backend = backend_info()
+    alignment_ready = backend.get("device") == "cuda"
+    capabilities = ["separation", "guides", *(["alignment"] if alignment_ready else [])]
+    return {"protocol": 1, "machine_id": machine_id(), **backend, "capabilities": capabilities,
+            "busy": gpu_lock.locked(),
+            "ready": not missing_tools and alignment_ready, "missing_tools": missing_tools,
+            "alignment_error": None if alignment_ready else f"CUDA alignment is unavailable; renderer selected {backend.get('device', 'unknown')}",
             "free_disk": shutil.disk_usage(ROOT).free}
+
+
+@app.post("/v1/guides")
+async def create_guides(request: Request):
+    authorize(request)
+    body = await request.body()
+    if len(body) > MAX_ALIGNMENT_BYTES:
+        raise HTTPException(413, "Guide request is too large")
+    try:
+        lines = json.loads(body)["lines"]
+        if not isinstance(lines, list) or len(lines) > 5000 or any(
+                not isinstance(line, dict) or not isinstance(line.get("text"), str) or len(line["text"]) > 2000
+                for line in lines):
+            raise ValueError
+    except (KeyError, TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
+        raise HTTPException(422, "Invalid guide lines")
+    from . import guides
+    def generate():
+        with guide_lock:
+            return guides.add_all(lines)
+    guided = await asyncio.to_thread(generate)
+    return {"protocol": 1, "machine_id": machine_id(), "lines": guided}
 
 
 @app.post("/v1/jobs", status_code=202)
 async def create_job(request: Request):
     authorize(request)
-    key = request.headers.get("X-KTVibes-Job-Key", "")
+    kind = request.headers.get("X-KTVibes-Job-Type", "separation")
+    if kind not in ("separation", "alignment"):
+        raise HTTPException(400, "Unknown renderer job type")
+    supplied_key = request.headers.get("X-KTVibes-Job-Key", "")
+    key = f"{kind}:{supplied_key}" if supplied_key else ""
     with state_lock:
         if key and key in keys:
             existing = jobs.get(keys[key])
@@ -186,7 +260,7 @@ async def create_job(request: Request):
         if key:
             keys[key] = job_id
     folder = ROOT / "jobs" / job_id
-    source = folder / "audio.m4a"
+    source = folder / ("audio.m4a" if kind == "separation" else "vocals.opus")
     size = 0
     try:
         folder.mkdir(parents=True)
@@ -210,7 +284,10 @@ async def create_job(request: Request):
             if key and keys.get(key) == job_id:
                 keys.pop(key, None)
         raise HTTPException(400, "Audio source is empty")
-    job = {"id": job_id, "protocol": 1, "status": "queued", "stage": "queued", "progress": 0.0, "key": key or None,
+    job = {"id": job_id, "protocol": 1, "kind": kind,
+           "status": "queued" if kind == "separation" else "ready",
+           "stage": "queued" if kind == "separation" else None,
+           "progress": 0.0 if kind == "separation" else 1.0, "key": key or None,
            "created_at": time.time(), "folder": folder, "machine_id": machine_id()}
     with state_lock:
         reservations.discard(job_id)
@@ -218,8 +295,40 @@ async def create_job(request: Request):
         if key:
             keys[key] = job_id
         save_job(job)
-    start_job(job_id)
+    if kind == "separation":
+        start_job(job_id)
     return {"id": job_id}
+
+
+@app.post("/v1/jobs/{job_id}/alignment")
+async def align_job(job_id: str, request: Request):
+    authorize(request)
+    job = jobs.get(job_id)
+    if not job or job.get("kind") != "alignment":
+        raise HTTPException(404, "Alignment job not found")
+    body = await request.body()
+    if len(body) > MAX_ALIGNMENT_BYTES:
+        raise HTTPException(413, "Alignment request is too large")
+    try:
+        payload = json.loads(body)
+        lines = payload["lines"]
+        if not isinstance(lines, list) or len(lines) > 5000:
+            raise ValueError
+        if any(not isinstance(line, dict) or not isinstance(line.get("text"), str) or len(line["text"]) > 2000
+               or not isinstance(line.get("t"), (int, float)) or not math.isfinite(line["t"]) or line["t"] < 0
+               for line in lines):
+            raise ValueError
+    except (KeyError, TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
+        raise HTTPException(422, "Invalid alignment lines")
+    with state_lock:
+        if job["status"] != "ready" or job.get("alignment_complete"):
+            raise HTTPException(409, "Alignment job is not available")
+        update_job(job, persist=True, status="queued", stage="aligning", progress=0.0)
+    try:
+        return await asyncio.to_thread(run_alignment, job, lines)
+    except Exception as exc:
+        update_job(job, persist=True, status="failed", stage=None, error=str(exc), finished_at=time.time())
+        raise HTTPException(500, str(exc)) from exc
 
 
 @app.get("/v1/jobs/{job_id}")

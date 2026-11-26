@@ -6,7 +6,7 @@ import os
 import time
 from pathlib import Path
 import soundfile as sf
-from . import align, guides, songbook, stems, youtube, lyrics
+from . import align, exports, guides, renderers, songbook, stems, youtube, lyrics
 from .library import open_beneath
 
 log = logging.getLogger(__name__)
@@ -75,16 +75,18 @@ def stage_local(root: Path, relative: str, destination: Path, expected_hash: str
 
 def add_guides(lines: list[dict]) -> list[dict]:
     """Every pronunciation guide; each writes only its own unit slots, so cached lines can be redone."""
-    return lyrics.add_kana(lyrics.add_jyutping(guides.add_hangul(lyrics.add_korean_romanization(lyrics.add_pinyin(lyrics.add_romaji(lines))))))
+    return guides.add_all(lines)
 
 def save_timed(folder: Path, key: str, aligned: bool, lines: list[dict]):
     temporary = folder / "timed.tmp"
     temporary.write_text(json.dumps({"key": key, "aligned": aligned, "guides": GUIDES_VERSION, "lines": lines}, ensure_ascii=False), encoding="utf-8")
     temporary.replace(folder / "timed.json")
 
-def timed_lyrics(folder: Path, raw: str, samples_path: Path, lines: list[dict], progress=None) -> list[dict]:
+def timed_lyrics(folder: Path, raw: str, samples_path: Path, lines: list[dict], progress=None,
+                 library=None, renderer_id=None) -> list[dict]:
     """Word timing and guides for these lyrics, reused from timed.json when the LRC text is unchanged."""
     key = f"{TIMING_VERSION}:{hashlib.sha256(raw.encode()).hexdigest()}"
+    renderer = library.renderer(renderer_id) if library and renderer_id else (library.selected_renderer() if library else {"id": "local"})
     try:
         cached = json.loads((folder / "timed.json").read_text(encoding="utf-8"))
         # Energy-only timing (the aligner failed) is retried once per run, not on every play.
@@ -97,27 +99,38 @@ def timed_lyrics(folder: Path, raw: str, samples_path: Path, lines: list[dict], 
             # Guides are quick to redo: songs cached before a guide changed get them without aligning again.
             # Failing that (say, a read-only cache) still leaves the timing, which is the slow part.
             try:
-                add_guides(lines_cached)
+                if renderer["id"] == "local":
+                    add_guides(lines_cached)
+                else:
+                    lines_cached = renderers.add_guides(lines_cached, library, renderer_id)
                 save_timed(folder, key, cached.get("aligned", True), lines_cached)
             except Exception:
                 log.exception("Could not refresh the guides for %s", folder.name)
         return lines_cached
-    samples, rate = sf.read(samples_path, dtype="float32")
-    energy = lyrics.envelope(samples, rate)
-    if shift := lyrics.find_shift(lines, energy):
-        log.info("Lyrics for %s shifted %+.2fs to match the vocals", folder.name, shift)
-        lyrics.shift_lines(lines, shift)
-    if any(moved := lyrics.shift_sections(lines, energy)):
-        log.info("Lyric sections for %s moved %s to match the vocals", folder.name, moved)
-    aligned = True
-    try:
-        # Forced alignment on the vocals; lines it cannot place keep the energy estimate.
-        align.align(lines, samples, rate, progress=progress)
-    except Exception:
-        log.exception("Forced alignment unavailable for %s", folder.name)
-        aligned = False
-    lyrics.time_units(lines, energy)
-    lines = add_guides(lines)
+    if renderer["id"] != "local":
+        result = renderers.align(samples_path, lines, progress, library, renderer_id)
+        lines, aligned = result["lines"], result["aligned"]
+        if result.get("shift"):
+            log.info("Lyrics for %s shifted %+.2fs to match the vocals", folder.name, result["shift"])
+        if any(result.get("sections") or []):
+            log.info("Lyric sections for %s moved %s to match the vocals", folder.name, result["sections"])
+    else:
+        samples, rate = sf.read(samples_path, dtype="float32")
+        energy = lyrics.envelope(samples, rate)
+        if shift := lyrics.find_shift(lines, energy):
+            log.info("Lyrics for %s shifted %+.2fs to match the vocals", folder.name, shift)
+            lyrics.shift_lines(lines, shift)
+        if any(moved := lyrics.shift_sections(lines, energy)):
+            log.info("Lyric sections for %s moved %s to match the vocals", folder.name, moved)
+        aligned = True
+        try:
+            # Forced alignment on the vocals; lines it cannot place keep the energy estimate.
+            align.align(lines, samples, rate, progress=progress)
+        except Exception:
+            log.exception("Forced alignment unavailable for %s", folder.name)
+            aligned = False
+        lyrics.time_units(lines, energy)
+        lines = add_guides(lines)
     save_timed(folder, key, aligned, lines)
     return lines
 
@@ -130,11 +143,11 @@ preparation_locks = {}
 publish_lock = asyncio.Lock()
 
 def warm_models(library=None):
-    """Both models take seconds to load; load them while the server starts, not when the first song is queued."""
-    models = [("alignment", align.warm)]
-    if not library or library.selected_renderer()["id"] == "local":
-        from . import separate as separation
-        models.insert(0, ("separation", separation.warm))
+    """Warm local models only when this machine was explicitly selected as the renderer."""
+    if library and library.selected_renderer()["id"] != "local":
+        return
+    from . import separate as separation
+    models = [("separation", separation.warm), ("alignment", align.warm)]
     for name, load in models:
         try:
             load()
@@ -144,6 +157,9 @@ def warm_models(library=None):
 async def _prepare(state, item, cache: Path, library=None, promote=True, renderer_id=None):
     """Prepare one queue or curated-library item using the same cache and artifact contract."""
     folder = cache / item["id"]
+    renderer = library.renderer(renderer_id) if library and renderer_id else (library.selected_renderer() if library else {"id": "local"})
+    renderer_id = renderer["id"]
+    remote = renderer["id"] != "local"
     def check():
         # A removed live song stops holding up the queue. Curated jobs are not queue members.
         if promote and item is not state.current and item not in state.upcoming:
@@ -162,8 +178,9 @@ async def _prepare(state, item, cache: Path, library=None, promote=True, rendere
             if video is None or video.done():
                 video = videos[item["id"]] = asyncio.ensure_future(asyncio.to_thread(fetch_video, item["id"], folder, reporter(state, item, "video")))
         if not stems.ready(folder):
-            # Songs cached as WAV or FLAC convert in seconds instead of separating again.
-            gain = await asyncio.to_thread(stems.migrate, folder, meta.get("stem_gain"))
+            # Local rendering can migrate old stems; remote rendering rebuilds them without controller DSP.
+            gain = None if remote else await asyncio.to_thread(stems.migrate, folder, meta.get("stem_gain"))
+            analysis = None
             if gain is None:
                 if not (folder / "audio.m4a").is_file():
                     item["status"], item["step"], item["progress"] = "downloading", "audio", 0.0
@@ -177,10 +194,20 @@ async def _prepare(state, item, cache: Path, library=None, promote=True, rendere
                     check()
                 item["status"], item["step"], item["progress"] = "separating", "vocals", 0.0
                 await state.broadcast()
-                meta["separation_seconds"], gain = await asyncio.to_thread(
+                meta["separation_seconds"], gain, analysis = await asyncio.to_thread(
                     separate, folder / "audio.m4a", folder, reporter(state, item, "vocals"), library, renderer_id)
+                if remote:
+                    for ext in stems.OLD:
+                        for name in stems.NAMES:
+                            (folder / f"{name}.{ext}").unlink(missing_ok=True)
             meta["stem_gain"] = gain
             save_meta(folder, meta)  # the gain must survive even if a later step fails
+        else:
+            recovered = renderers.cached_separation(folder) if remote else None
+            if recovered:
+                meta["separation_seconds"], meta["stem_gain"], analysis = recovered
+            else:
+                analysis = None
         check()
         if video and not video.done():
             item["status"], item["step"], item["progress"] = "downloading", "video", 0.0
@@ -197,9 +224,13 @@ async def _prepare(state, item, cache: Path, library=None, promote=True, rendere
         stamps = [p.stat().st_mtime for name in stems.NAMES if (p := stems.path(folder, name))]
         meta.pop("music_end", None)  # the old instrumental-only value
         known = meta.get("song_end")
-        if stamps and not (isinstance(known, list) and len(known) == 2 and known[0] == stamps):
+        if stamps and analysis and analysis.get("song_end"):
+            known = meta["song_end"] = [stamps, analysis["song_end"]]
+        elif stamps and not (isinstance(known, list) and len(known) == 2 and known[0] == stamps) and not remote:
             end = await asyncio.to_thread(stems.song_end, folder)
             known = meta["song_end"] = [stamps, end] if end else None
+        elif stamps and not (isinstance(known, list) and len(known) == 2 and known[0] == stamps):
+            known = meta["song_end"] = None
         if stamps and known:
             item["music_end"] = known[1]
         item["gain"] = float(meta.get("stem_gain") or 1)
@@ -233,10 +264,13 @@ async def _prepare(state, item, cache: Path, library=None, promote=True, rendere
             item["step"], item["progress"] = "timing", 0.0
             await state.broadcast()
             try:
-                item["lyrics"] = await asyncio.to_thread(timed_lyrics, folder, raw, stems.path(folder, "vocals"), item["lyrics"], reporter(state, item, "timing"))
+                item["lyrics"] = await asyncio.to_thread(timed_lyrics, folder, raw, stems.path(folder, "vocals"), item["lyrics"],
+                                                           reporter(state, item, "timing"), library, renderer_id)
                 lyrics.line_starts(item["lyrics"])  # cheap, so kept out of the timing cache
             except Exception:
                 log.exception("Word timing unavailable for %s", item["id"])
+                if remote:
+                    raise
         item["offset"] = float(meta.get("lyric_offset") or 0)
         meta.update(duration=item["duration"], artist=item["artist"], title=item["title"],
                     provider=item.get("provider", meta.get("provider", "youtube")))
@@ -245,6 +279,13 @@ async def _prepare(state, item, cache: Path, library=None, promote=True, rendere
             item["number"] = songbook.assign(cache, meta)
             save_meta(folder, meta)
         check()
+        if library:
+            if not library.share_root:
+                raise RuntimeError("Windows share is unavailable; completed packages must be published before they are ready")
+            item["status"], item["step"], item["progress"] = "publishing", "share", None
+            await state.broadcast()
+            await asyncio.to_thread(exports.publish, folder, library.share_root)
+            check()
         item["status"], item["step"], item["progress"] = "ready", None, None
         if promote:
             state.promote()

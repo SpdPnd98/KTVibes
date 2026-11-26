@@ -1,6 +1,7 @@
 """HTTP/WebSocket contract checks, runnable once uv sync installs dependencies."""
 import asyncio
 import importlib.util
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -19,8 +20,8 @@ class APITests(unittest.TestCase):
         async def idle_worker(*args):
             await asyncio.Event().wait()
         self.patches = [patch.object(main, 'state', State()), patch.object(main, 'CACHE', Path(self.temp.name)),
-                        patch.object(main.worker, 'run', idle_worker), patch.object(main.curator, 'run', idle_worker),
-                        patch.object(main, 'import_root', return_value=None)]
+                         patch.object(main.worker, 'run', idle_worker), patch.object(main.curator, 'run', idle_worker),
+                         patch.object(main, 'import_root', return_value=None), patch.object(main, 'share_root', return_value=None)]
         for item in self.patches:
             item.start()
         self.client_context = TestClient(main.app)
@@ -118,6 +119,10 @@ class APITests(unittest.TestCase):
         imported = self.client.post('/api/owner/import', json={'content': csv})
         self.assertEqual(imported.json()['imported'], 1)
         candidate = self.client.get('/api/owner/candidates', params={'status': 'pending'}).json()[0]
+        not_approved = self.client.post('/api/owner/jobs', json={'ids': [candidate['id']]})
+        self.assertEqual(not_approved.status_code, 409)
+        self.assertIn('not approved', not_approved.json()['detail'])
+        self.assertIsInstance(self.client.post('/api/owner/jobs', json={'ids': []}).json()['detail'], list)
         reviewed = self.client.post('/api/owner/candidates/review', json={'ids': [candidate['id']], 'status': 'approved'})
         self.assertEqual(reviewed.json()['changed'], 1)
         queued = self.client.post('/api/owner/jobs', json={'ids': [candidate['id']]})
@@ -134,6 +139,22 @@ class APITests(unittest.TestCase):
         self.assertEqual(selected.status_code, 200)
         renderers = self.client.get('/api/owner/renderers').json()
         self.assertEqual(next(item for item in renderers if item['selected'])['name'], 'GPU')
+
+    def test_owner_edits_and_runs_youtube_discovery(self):
+        settings = {'enabled': True, 'interval_hours': 24, 'results_per_source': 5,
+                    'search_terms': ['Ado', 'Hatsune Miku'],
+                    'channels': ['https://www.youtube.com/@ChaR_tarako/videos']}
+        saved = self.client.put('/api/owner/discovery', json=settings)
+        self.assertEqual(saved.status_code, 200)
+        self.assertEqual(saved.json()['settings']['channels'], ['https://www.youtube.com/@ChaR_tarako'])
+        searched = [{'id': 'abcdefghijk', 'channel': 'Ado', 'parsed': {'artist': 'Ado', 'title': 'Song'}}]
+        channel = [{'id': 'bbbbbbbbbbb', 'channel': "Cha'R", 'parsed': {'artist': "Cha'R", 'title': 'Glow'}}]
+        with patch.object(self.main.discovery.youtube, 'search', return_value=searched) as search, \
+                patch.object(self.main.discovery.youtube, 'channel_videos', return_value=channel):
+            response = self.client.post('/api/owner/discovery/run')
+        self.assertEqual((response.status_code, response.json()['result']['imported']), (200, 2))
+        self.assertEqual(search.call_count, 4)
+        self.assertEqual(len(self.client.get('/api/owner/candidates', params={'status': 'pending'}).json()), 2)
 
     def test_owner_token_protects_owner_apis(self):
         with patch.dict('os.environ', {'KTVIBES_OWNER_TOKEN': 'secret'}):
@@ -432,6 +453,55 @@ class RendererAgentTests(unittest.TestCase):
         self.assertEqual(second.json()['id'], first.json()['id'])
         self.assertEqual(len(self.agent.jobs), 1)
 
+    def test_health_reports_missing_media_tools(self):
+        with patch.object(self.agent.shutil, 'which', side_effect=lambda name: None if name == 'ffprobe' else '/bin/tool'), \
+                patch('ktvibes.separate.backend_info', return_value={'device': 'cuda', 'backend': 'CUDA'}):
+            health = self.client.get('/v1/health', headers=self.headers).json()
+        self.assertFalse(health['ready'])
+        self.assertEqual(health['missing_tools'], ['ffprobe'])
+        self.assertIn('alignment', health['capabilities'])
+
+    def test_health_refuses_alignment_without_cuda(self):
+        with patch.object(self.agent.shutil, 'which', return_value='/bin/tool'), \
+                patch('ktvibes.separate.backend_info', return_value={'device': 'cpu', 'backend': 'CPU'}):
+            health = self.client.get('/v1/health', headers=self.headers).json()
+        self.assertFalse(health['ready'])
+        self.assertNotIn('alignment', health['capabilities'])
+        self.assertIn('CUDA alignment is unavailable', health['alignment_error'])
+
+    def test_alignment_job_runs_uploaded_vocals_on_renderer(self):
+        headers = {'X-KTVibes-Renderer-Token': 'secret', 'X-KTVibes-Job-Type': 'alignment'}
+        with patch.object(self.agent, 'start_job') as start:
+            created = self.client.post('/v1/jobs', content=b'vocals', headers=headers)
+        job_id = created.json()['id']
+        job = self.agent.jobs[job_id]
+        self.assertEqual((job['kind'], job['status']), ('alignment', 'ready'))
+        self.assertEqual((job['folder'] / 'vocals.opus').read_bytes(), b'vocals')
+        start.assert_not_called()
+
+        def aligned(current, lines):
+            result = {'protocol': 1, 'machine_id': self.agent.machine_id(), 'aligned': True, 'lines': lines,
+                      'shift': 0, 'sections': []}
+            self.agent.update_job(current, persist=True, status='ready', stage=None, progress=1.0,
+                                  alignment_complete=True)
+            return result
+
+        lines = [{'t': 0.1, 'text': 'hello'}]
+        with patch.object(self.agent, 'run_alignment', side_effect=aligned) as run:
+            response = self.client.post(f'/v1/jobs/{job_id}/alignment', json={'lines': lines}, headers=headers)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['lines'], lines)
+        run.assert_called_once()
+
+    def test_pronunciation_guides_run_on_renderer(self):
+        lines = [{'t': 0.1, 'text': 'hello', 'units': [['hello', 0.1, 0.8]]}]
+        guided = [{'t': 0.1, 'text': 'hello', 'units': [['hello', 0.1, 0.8, None, '헬로']]}]
+        with patch('ktvibes.guides.add_all', return_value=guided) as generate:
+            response = self.client.post('/v1/guides', json={'lines': lines}, headers=self.headers)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['lines'], guided)
+        generate.assert_called_once_with(lines)
+
     def test_failed_job_can_be_deleted_and_retention_cleans_it(self):
         with patch.object(self.agent, 'start_job'):
             job_id = self.client.post('/v1/jobs', content=b'audio', headers=self.headers).json()['id']
@@ -440,6 +510,21 @@ class RendererAgentTests(unittest.TestCase):
         self.agent.cleanup_finished(max_age=0)
         self.assertNotIn(job_id, self.agent.jobs)
         self.assertFalse(job['folder'].exists())
+
+    def test_interrupted_alignment_is_failed_for_a_clean_retry(self):
+        job_id = 'a' * 32
+        folder = self.agent.ROOT / 'jobs' / job_id
+        folder.mkdir(parents=True)
+        status = {'id': job_id, 'protocol': 1, 'kind': 'alignment', 'status': 'running',
+                  'stage': 'aligning', 'progress': 0.5, 'created_at': self.agent.time.time(),
+                  'machine_id': self.agent.machine_id(), 'key': None}
+        (folder / 'status.json').write_text(json.dumps(status), encoding='utf-8')
+        (folder / 'vocals.opus').write_bytes(b'vocals')
+        self.agent.restore_jobs()
+        self.assertEqual(self.agent.jobs[job_id]['status'], 'failed')
+        self.assertIn('submit it again', self.agent.jobs[job_id]['error'])
+        saved = json.loads((folder / 'status.json').read_text(encoding='utf-8'))
+        self.assertEqual(saved['status'], 'failed')
 
 
 class PlayNextTests(unittest.IsolatedAsyncioTestCase):

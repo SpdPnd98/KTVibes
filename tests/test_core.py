@@ -27,6 +27,8 @@ class LyricsTests(unittest.TestCase):
         self.assertEqual(parse_title('Adele - Hello', 'AdeleVEVO'), {'artist': 'Adele', 'title': 'Hello'})
         self.assertEqual(parse_title('Simple Plan - Perfect // Lyrics'), {'artist': 'Simple Plan', 'title': 'Perfect'})
         self.assertEqual(parse_title('Simple Plan - Perfect (Lyrics) 🎵'), {'artist': 'Simple Plan', 'title': 'Perfect'})
+        self.assertEqual(parse_title("Cha’R - New Glow【LIVE】10/24/2026 Shibuya Milkyway", "Cha’R"),
+                         {'artist': 'Cha’R', 'title': 'New Glow'})
 
 class YouTubeErrorTests(unittest.TestCase):
     def test_bot_check_is_explained(self):
@@ -301,6 +303,8 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as folder:
             state = State()
             state.restore(Path(folder) / 'queue.json')
+            changed = []
+            state.meta_changed = changed.append
             (Path(folder) / 'abcdefghijk').mkdir()
             meta = Path(folder) / 'abcdefghijk' / 'meta.json'
             meta.write_text(json.dumps({'title': '晴天'}), encoding='utf-8')
@@ -310,6 +314,7 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(state.offset, 1.0)
             await state.control({'action': 'offset', 'delta': .5})
             self.assertEqual(json.loads(meta.read_text(encoding='utf-8')), {'title': '晴天', 'lyric_offset': 1.5})
+            self.assertEqual(changed, ['abcdefghijk'])
 
     async def test_classic_room_timer_holds_the_next_song_until_time_is_added(self):
         state = State()
@@ -404,6 +409,70 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(state.current)
 
 class WorkerRunTests(unittest.IsolatedAsyncioTestCase):
+    async def test_preparation_pins_renderer_selected_at_start(self):
+        import tempfile
+        from pathlib import Path
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock, Mock, patch
+        from ktvibes import worker
+        state = Mock()
+        state.broadcast = AsyncMock()
+        library = Mock()
+        library.selected_renderer.return_value = {'id': 'gpu'}
+        with tempfile.TemporaryDirectory() as temp:
+            cache = Path(temp) / 'cache'
+            share = Path(temp) / 'share'
+            folder = cache / 'aaaaaaaaaaa'
+            folder.mkdir(parents=True)
+            share.mkdir()
+            library.share_root = share
+            for name in worker.stems.NAMES:
+                (folder / f'{name}.opus').write_bytes(b'stem')
+            (folder / 'meta.json').write_text('{"lyrics_identity":["A","Song"],"stem_gain":1}', encoding='utf-8')
+            raw = '[00:00.10]hello'
+            (folder / 'lyrics.lrc').write_text(raw, encoding='utf-8')
+            item = State.entry('aaaaaaaaaaa', 'A', 'Song')
+            timed_lines = parse_lrc(raw)
+            with patch.object(worker, 'fetch_video', return_value=None), \
+                    patch.object(worker.sf, 'info', return_value=SimpleNamespace(duration=100)), \
+                    patch.object(worker.renderers, 'cached_separation', return_value=None), \
+                    patch.object(worker, 'timed_lyrics', return_value=timed_lines) as timed, \
+                    patch.object(worker.exports, 'publish') as publish:
+                await worker.prepare(state, item, cache, library=library, promote=False)
+        self.assertEqual(item['status'], 'ready')
+        self.assertEqual(library.selected_renderer.call_count, 1)
+        self.assertEqual(timed.call_args.args[-1], 'gpu')
+        publish.assert_called_once()
+
+    async def test_preparation_cannot_be_ready_without_the_required_share(self):
+        import tempfile
+        from pathlib import Path
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock, Mock, patch
+        from ktvibes import worker
+        state = Mock()
+        state.broadcast = AsyncMock()
+        library = Mock()
+        library.selected_renderer.return_value = {'id': 'local'}
+        library.share_root = None
+        with tempfile.TemporaryDirectory() as temp:
+            cache = Path(temp)
+            folder = cache / 'aaaaaaaaaaa'
+            folder.mkdir()
+            for name in worker.stems.NAMES:
+                (folder / f'{name}.opus').write_bytes(b'stem')
+            item = State.entry('aaaaaaaaaaa', 'A', 'Song')
+            async def no_lyrics(*args):
+                return {'raw': '', 'lines': []}
+            with patch.object(worker, 'fetch_video', return_value=None), \
+                    patch.object(worker.sf, 'info', return_value=SimpleNamespace(duration=100)), \
+                    patch.object(worker.lyrics, 'fetch', no_lyrics), \
+                    patch.object(worker.exports, 'publish') as publish:
+                await worker.prepare(state, item, cache, library=library, promote=False)
+        self.assertEqual(item['status'], 'error')
+        self.assertIn('Windows share is unavailable', item['error'])
+        publish.assert_not_called()
+
     async def test_removed_song_stops_holding_up_the_queue(self):
         import tempfile, threading
         from pathlib import Path
@@ -539,6 +608,62 @@ class WorkerTests(unittest.TestCase):
                 with patch.object(worker, 'STARTED', time.time() + 60):  # as if KTVibes restarted
                     worker.timed_lyrics(folder, '[00:00.10]again', folder / 'vocals.wav', parse_lrc('[00:00.10]again'))
                 self.assertEqual(align.call_count, 2)
+
+    def test_remote_timing_never_decodes_or_aligns_on_the_controller(self):
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import Mock, patch
+        from ktvibes import worker
+        library = Mock()
+        library.selected_renderer.return_value = {'id': 'gpu'}
+        timed = [{'t': 0.1, 'text': 'hello', 'units': [['hello', 0.1, 0.8]]}]
+        with tempfile.TemporaryDirectory() as folder, \
+              patch.object(worker.renderers, 'align', return_value={'lines': timed, 'aligned': True}) as remote, \
+              patch.object(worker.sf, 'read') as decode, \
+              patch.object(worker.align, 'align') as local, \
+              patch.object(worker, 'add_guides') as local_guides:
+            result = worker.timed_lyrics(Path(folder), '[00:00.10]hello', Path(folder) / 'vocals.opus',
+                                         parse_lrc('[00:00.10]hello'), library=library)
+        self.assertEqual(result, timed)
+        remote.assert_called_once()
+        decode.assert_not_called()
+        local.assert_not_called()
+        local_guides.assert_not_called()
+
+    def test_stale_cached_guides_refresh_on_the_remote_renderer(self):
+        import json
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import Mock, patch
+        from ktvibes import worker
+        library = Mock()
+        library.selected_renderer.return_value = {'id': 'gpu'}
+        raw = '[00:00.10]hello'
+        timed = [{'t': 0.1, 'text': 'hello', 'units': [['hello', 0.1, 0.8]]}]
+        guided = [{'t': 0.1, 'text': 'hello', 'units': [['hello', 0.1, 0.8, None, '헬로']]}]
+        with tempfile.TemporaryDirectory() as folder:
+            folder = Path(folder)
+            with patch.object(worker.renderers, 'align', return_value={'lines': timed, 'aligned': True}):
+                worker.timed_lyrics(folder, raw, folder / 'vocals.opus', parse_lrc(raw), library=library)
+            cached = json.loads((folder / 'timed.json').read_text(encoding='utf-8'))
+            cached['guides'] = 0
+            (folder / 'timed.json').write_text(json.dumps(cached), encoding='utf-8')
+            with patch.object(worker.renderers, 'add_guides', return_value=guided) as remote, \
+                    patch.object(worker, 'add_guides') as local:
+                result = worker.timed_lyrics(folder, raw, folder / 'vocals.opus', parse_lrc(raw), library=library)
+        self.assertEqual(result, guided)
+        remote.assert_called_once()
+        local.assert_not_called()
+
+    def test_remote_renderer_does_not_warm_local_models(self):
+        from unittest.mock import Mock, patch
+        from ktvibes import worker
+        library = Mock()
+        library.selected_renderer.return_value = {'id': 'gpu'}
+        with patch.object(worker.align, 'warm') as alignment, patch('ktvibes.separate.warm') as separation:
+            worker.warm_models(library)
+        alignment.assert_not_called()
+        separation.assert_not_called()
 
     def test_a_cache_that_cannot_be_saved_still_keeps_its_timing(self):
         import json
