@@ -77,6 +77,8 @@ Allow incoming connections if your firewall asks, so phones can reach the remote
 
 ## Use
 
+For this Mac-controller plus RTX-renderer deployment, including reusable environment files and restart checks, see [Starting KTVibes and configuring environment variables](docs/startup-and-environment.md).
+
 1. Run `ktvibes`.
 2. On the TV computer, open `http://localhost:8765` and click **Enable sound**. Click **Fullscreen** if you like.
 3. Scan the QR code with a phone, search for a song, and tap it to queue it.
@@ -91,7 +93,7 @@ The YouTube watchlist discovers candidates from editable search terms and prefer
 
 For shared M4A files, put tracks in the configured import folder using `Artist - Title.m4a` names, then choose **Scan shared M4As** in Backstage. On this custom macOS setup, `/Volumes/Karaoke Shared/incoming` is detected automatically when mounted. Files remain on the share; KTVibes verifies and copies each source into its local cache before processing. Local tracks have no music video unless one is added separately.
 
-Every completed song is also published to `/Volumes/Karaoke Shared/imported/<recording-id>/`. The package contains the source audio, both generated stems, metadata, timed lyrics and video when available. `manifest.json` records SHA-256 checksums, and a matching manifest is written under `manifests/`. Publication uses a temporary directory and same-share rename, retains the previous package until the external manifest and checksums validate, and only then marks preparation ready. Publication errors are recorded under `failed/`; retrying preparation reuses the local cache and retries publication.
+Every completed song is published to `/Volumes/Karaoke Shared/imported/<recording-id>/`. The package contains the source audio, both generated stems, metadata, timed lyrics and video when available. `manifest.json` records SHA-256 checksums, and a matching manifest is written under `manifests/`. Publication uses a temporary directory and same-share rename, retains the previous package until the external manifest and checksums validate, and only then marks preparation ready. Publication errors are recorded under `failed/`; retrying preparation reuses temporary local work and retries publication. By default, the verified shared package is authoritative and its completed local working copy is removed.
 
 For another mount, set the folder before starting KTVibes:
 
@@ -116,7 +118,7 @@ Aimer,Ref:rain,ja,Aimer - Ref-rain.m4a
 
 `artist` and `title` are required. `language` is optional. Importing the same source again updates its display metadata without losing its review decision. If a shared file changes, scan again; its checksum and cache identity are refreshed so stale stems are not reused.
 
-Approved preparation jobs are persistent. They run only when no live queue item is waiting for preparation. A job already separating cannot be preempted, but the next bulk song waits for the live queue. Finished songs enter the existing songbook and play from the karaoke machine's cache.
+Approved preparation jobs are persistent. They run only when no live queue item is waiting for preparation. A job already separating cannot be preempted, but the next bulk song waits for the live queue. Finished songs enter the existing songbook and play from the verified shared package.
 
 ### Separate GPU machine
 
@@ -127,7 +129,7 @@ export KTVIBES_RENDERER_TOKEN='replace-with-a-long-random-value'
 uv run ktvibes-renderer
 ```
 
-Start the main KTVibes server with the same `KTVIBES_RENDERER_TOKEN`. In Backstage, add the GPU machine as `http://<private-ip>:8790`, check its health, and select it. The karaoke machine downloads, stores, serves, and publishes media; Demucs separation, full-audio end detection, vocal-energy analysis, and MMS lyric alignment run on the GPU machine. It does not silently fall back to local models: if the renderer is unavailable or outdated, the job fails visibly and can be prepared again after the connection is restored. Already-prepared songs continue to play.
+Start the main KTVibes server with the same `KTVIBES_RENDERER_TOKEN`. In Backstage, add the GPU machine as `http://<private-ip>:8790`, check its health, and select it. The karaoke machine downloads temporary working media, serves completed packages from the share, and publishes results; Demucs separation, full-audio end detection, vocal-energy analysis, and MMS lyric alignment run on the GPU machine. It does not silently fall back to local models: if the renderer is unavailable or outdated, queued bulk work waits instead of consuming the batch. Already-prepared songs continue to play.
 
 Use this plain-HTTP mode only on a trusted wired LAN or an encrypted private network such as Tailscale/WireGuard. The token and song audio are not protected from network inspection by HTTP. A reverse proxy with HTTPS can be used when the private network is not trusted.
 
@@ -170,9 +172,11 @@ This pulls the latest version; the next `ktvibes` installs any new dependencies.
 |---|---|---|
 | `KTVIBES_PORT` | `8765` | Server port |
 | `KTVIBES_REMOTE_URL` | detected | Address in the QR code. Set it if detection picks the wrong network, e.g. with a VPN: `http://<pc-ip>:8765` (the QR code adds `/remote`) |
-| `KTVIBES_CACHE` | `./cache` | Where songs are stored, about 30 MB each |
+| `KTVIBES_CACHE` | `./cache` | Temporary preparation work plus persistent queue and library state |
+| `KTVIBES_KEEP_LOCAL_CACHE` | `0` | Set to `1` to retain completed local package copies after verified share publication |
 | `KTVIBES_COOKIES_FROM_BROWSER` | unset | If songs fail with "Sign in to confirm you're not a bot", set this to a browser you're signed in to YouTube with (`chrome`, `firefox`, `edge`, `safari`…), and KTVibes uses its YouTube cookies |
 | `KTVIBES_VIDEO_HEIGHT` | `720` | Highest music video resolution to download, e.g. `1080` (about twice the size) |
+| `KTVIBES_NODE` | auto-detected | Optional path to Node.js 22+ for yt-dlp's YouTube player support |
 | `KTVIBES_OPEN_BROWSER` | unset | Set to `1` to open the TV page in the default browser when KTVibes starts. The desktop apps do this |
 | `KTVIBES_IMPORT_ROOT` | auto-detected on this Mac | Shared folder containing source M4A files; paths in CSV files are relative to this folder |
 | `KTVIBES_SHARE_ROOT` | `/Volumes/Karaoke Shared` | Optional assertion of the required shared root; any other path is rejected rather than used as local output |

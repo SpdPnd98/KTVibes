@@ -9,6 +9,7 @@ import shutil
 from pathlib import Path
 import socket
 import math
+import weakref
 from typing import Literal
 from uuid import uuid4
 import qrcode
@@ -27,6 +28,9 @@ PORT = int(os.environ.get("KTVIBES_PORT", 8765))
 state = State()
 catalog = None
 publication_tasks = {}
+song_edit_locks = weakref.WeakKeyDictionary()
+published_song_cache = {}
+published_song_versions = {}
 RECORDING_ID = re.compile(r"(?:[A-Za-z0-9_-]{11}|local_[A-Za-z0-9_-]{16})")
 
 def share_root() -> Path | None:
@@ -45,17 +49,101 @@ def import_root() -> Path | None:
     return incoming if incoming and incoming.is_dir() else None
 
 
-def schedule_publication(recording_id: str):
+def completed_folder(recording_id: str) -> Path | None:
+    """Resolve a verified package; local folders are fallback only when no share is configured."""
+    shared = catalog and catalog.share_root
+    known = exports.known(shared) if shared else None
+    if known is not None and recording_id in known:
+        return shared / "imported" / recording_id
+    if shared:
+        return None
+    local = CACHE / recording_id
+    return local if stems.prepared(local) and (local / "meta.json").is_file() else None
+
+
+def working_folder(recording_id: str) -> Path:
+    """Stage a published package only when an edit needs writable files."""
+    local = CACHE / recording_id
+    if stems.prepared(local) and (local / "meta.json").is_file():
+        return local
+    if local.exists():
+        raise RuntimeError("Incomplete local working files already exist for this song")
+    if catalog is None or not catalog.share_root:
+        raise RuntimeError("Windows share is unavailable")
+    return exports.stage(catalog.share_root, recording_id, local)
+
+
+def discard_completed_cache(folder: Path):
+    if not worker.keep_local_cache():
+        shutil.rmtree(folder, ignore_errors=True)
+
+
+async def cancellation_safe_thread(function, *args):
+    running = asyncio.create_task(asyncio.to_thread(function, *args))
+    try:
+        return await asyncio.shield(running)
+    except asyncio.CancelledError:
+        await running
+        raise
+
+
+async def publish_working_folder(recording_id: str, folder: Path, wait_for_playback: bool = False):
+    """Publish a metadata edit without overlapping another share write or replacing an active package."""
+    if catalog is None or not catalog.share_root:
+        raise RuntimeError("Windows share is unavailable")
+    if wait_for_playback:
+        while state.current and state.current["id"] == recording_id:
+            await asyncio.sleep(1)
+    delays = (0, 1, 3, 7)
+    try:
+        for attempt, delay in enumerate(delays):
+            if delay:
+                await asyncio.sleep(delay)
+            if wait_for_playback:
+                while state.current and state.current["id"] == recording_id:
+                    await asyncio.sleep(1)
+            try:
+                async with worker.publish_lock():
+                    await cancellation_safe_thread(exports.publish, folder, catalog.share_root)
+                await asyncio.to_thread(catalog.publication_succeeded, recording_id)
+                await cancellation_safe_thread(discard_completed_cache, folder)
+                return
+            except OSError:
+                if attempt == len(delays) - 1:
+                    raise
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        await asyncio.to_thread(catalog.publication_failed, recording_id, str(exc))
+        raise
+
+
+def song_edit_lock(recording_id: str):
+    loop = asyncio.get_running_loop()
+    locks = song_edit_locks.setdefault(loop, {})
+    return locks.setdefault(recording_id, asyncio.Lock())
+
+
+def schedule_publication(recording_id: str, lyric_offset: float | None = None, update_offset: bool = True):
     """Debounce metadata-only updates so repeated lyric nudges produce one shared package."""
+    if update_offset and lyric_offset is None and state.current and state.current["id"] == recording_id:
+        lyric_offset = state.offset
     if previous := publication_tasks.get(recording_id):
         previous.cancel()
     async def publish_later():
         try:
             await asyncio.sleep(1)
-            if catalog is None or not catalog.share_root:
-                raise RuntimeError("Windows share is unavailable")
-            await asyncio.to_thread(exports.publish, CACHE / recording_id, catalog.share_root)
-            await asyncio.to_thread(catalog.publication_succeeded, recording_id)
+            while state.current and state.current["id"] == recording_id:
+                await asyncio.sleep(1)
+            async with song_edit_lock(recording_id):
+                if catalog is None or not catalog.share_root:
+                    raise RuntimeError("Windows share is unavailable")
+                folder = await asyncio.to_thread(working_folder, recording_id)
+                if lyric_offset is not None:
+                    meta = songbook.read(folder / "meta.json") or {}
+                    meta["lyric_offset"] = lyric_offset
+                    await asyncio.to_thread(worker.save_meta, folder, meta)
+                await publish_working_folder(recording_id, folder)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -72,11 +160,19 @@ async def lifespan(app):
     CACHE.mkdir(parents=True, exist_ok=True)
     catalog = Library(CACHE / "library.sqlite3", import_root(), share_root())
     state.meta_changed = schedule_publication
+    state.songbook_roots = [catalog.share_root / "imported"] if catalog.share_root else []
     state.build = build()
     await asyncio.to_thread(songbook.backfill, CACHE, stems.prepared)  # caches from before the songbook
+    # Publication already verifies shared checksums. Avoid rereading all media over SMB on every restart.
+    published = None
+    if exports.available(catalog.share_root):
+        try:
+            published = await asyncio.to_thread(exports.reconcile, CACHE, catalog.share_root, False)
+        except OSError:
+            pass  # a transient SMB error must not demote packages already known to be ready
+    if published is not None:
+        await asyncio.to_thread(catalog.reconcile, published)
     prepared = prepared_songs()
-    published = await asyncio.to_thread(exports.reconcile, CACHE, catalog.share_root)
-    await asyncio.to_thread(catalog.reconcile, published)
     state.restore(CACHE / "queue.json", seed=lambda: {id: meta["prepared"] for id, meta in prepared.items()})
     tasks = [asyncio.create_task(worker.run(state, CACHE, catalog)),
               asyncio.create_task(curator.run(state, CACHE, catalog)),
@@ -193,6 +289,10 @@ class CandidateAction(BaseModel):
 class CandidateReview(CandidateAction):
     status: Literal["pending", "approved", "rejected", "deferred"]
 
+class JobControl(BaseModel):
+    action: Literal["pause", "resume", "start", "retry"]
+    id: int | None = Field(default=None, gt=0)
+
 class RendererInput(BaseModel):
     name: str = Field(min_length=1, max_length=100)
     url: str = Field(min_length=1, max_length=300)
@@ -231,7 +331,7 @@ class DiscoverySettings(BaseModel):
 
 async def run_discovery(library: Library) -> dict:
     result = await asyncio.to_thread(discovery.run, library)
-    published = await asyncio.to_thread(exports.reconcile, CACHE, library.share_root)
+    published = await asyncio.to_thread(exports.reconcile, CACHE, library.share_root, False)
     await asyncio.to_thread(library.reconcile, published)
     return result
 
@@ -268,9 +368,16 @@ async def owner_run_discovery(request: Request):
     return {"result": result, "status": await asyncio.to_thread(discovery.status, library)}
 
 @app.get("/api/owner/candidates")
-async def owner_candidates(request: Request, status: Literal["pending", "approved", "rejected", "deferred"] | None = None):
+async def owner_candidates(request: Request, status: Literal["pending", "approved", "rejected", "deferred"] | None = None,
+                           page: int | None = Query(None, ge=1), page_size: int = Query(20, ge=1, le=100)):
     library = owner_store(request)
-    return await asyncio.to_thread(library.candidates, status)
+    if page is None:
+        return await asyncio.to_thread(library.candidates, status)
+    total = await asyncio.to_thread(library.candidate_count, status)
+    pages = max(1, math.ceil(total / page_size))
+    page = min(page, pages)
+    items = await asyncio.to_thread(library.candidates, status, page_size, (page - 1) * page_size)
+    return {"items": items, "total": total, "page": page, "page_size": page_size, "pages": pages}
 
 @app.post("/api/owner/import", status_code=201)
 async def owner_import(imported: CSVImport, request: Request):
@@ -327,9 +434,35 @@ async def owner_prepare(action: CandidateAction, request: Request):
     return {"queued": queued}
 
 @app.get("/api/owner/jobs")
-async def owner_jobs(request: Request):
+async def owner_jobs(request: Request, page: int | None = Query(None, ge=1), page_size: int = Query(20, ge=1, le=100)):
     library = owner_store(request)
-    return await asyncio.to_thread(library.jobs)
+    if page is None:
+        return await asyncio.to_thread(library.jobs)
+    total = await asyncio.to_thread(library.job_count)
+    pages = max(1, math.ceil(total / page_size))
+    page = min(page, pages)
+    items = await asyncio.to_thread(library.jobs, page_size, (page - 1) * page_size)
+    return {"items": items, "total": total, "page": page, "page_size": page_size, "pages": pages}
+
+@app.post("/api/owner/jobs/control")
+async def owner_control_jobs(control: JobControl, request: Request):
+    library = owner_store(request)
+    if control.action in ("start", "retry") and control.id is None:
+        raise HTTPException(422, "Choose a preparation job")
+    try:
+        if control.action == "pause":
+            changed = await asyncio.to_thread(library.pause_jobs, control.id)
+        elif control.action == "resume":
+            changed = await asyncio.to_thread(library.resume_jobs, control.id)
+        elif control.action == "start":
+            changed = await asyncio.to_thread(library.resume_jobs, control.id, True)
+        else:
+            changed = await asyncio.to_thread(library.retry_job, control.id)
+    except KeyError as exc:
+        raise HTTPException(404, str(exc.args[0])) from exc
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {"action": control.action, "changed": changed, "id": control.id}
 
 @app.get("/api/owner/renderers")
 async def owner_renderers(request: Request):
@@ -383,10 +516,55 @@ async def owner_delete_renderer(renderer_id: str, request: Request):
     return {"deleted": renderer_id}
 
 def prepared_songs() -> dict:
-    """Cached songs with stems and confirmed details, by video id."""
+    """Published songs with stems and confirmed details, by recording ID."""
     songs = {}
     active_local = catalog.active_local_ids() if catalog is not None else None
-    for meta_path in CACHE.glob("*/meta.json"):
+    published_ids = set()
+    if catalog is not None and catalog.share_root and exports.available(catalog.share_root):
+        root = catalog.share_root
+        cached = published_song_cache.setdefault(root, {})
+        versions = published_song_versions.setdefault(root, {})
+        try:
+            known = exports.known(root)
+            if known is None:
+                exports.published(root, verify_hashes=False)
+                known = exports.known(root) or {}
+        except OSError:
+            known = exports.known(root) or {}
+        for recording_id in set(cached) - set(known):
+            cached.pop(recording_id, None)
+            versions.pop(recording_id, None)
+        for recording_id, version in known.items():
+            if versions.get(recording_id) == version:
+                continue
+            cached.pop(recording_id, None)
+            folder = root / "imported" / recording_id
+            meta_path = folder / "meta.json"
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                if not (RECORDING_ID.fullmatch(recording_id) and meta.get("artist") and meta.get("title")
+                        and stems.prepared(folder)):
+                    continue
+                thumbnail = "/static/local-track.svg" if meta.get("provider") == "local" else f"https://i.ytimg.com/vi/{recording_id}/mqdefault.jpg"
+                cached[recording_id] = {
+                    "id": recording_id, "artist": meta["artist"], "title": meta["title"],
+                    "duration": meta.get("duration"), "thumbnail": thumbnail,
+                    "prepared": meta_path.stat().st_mtime, "number": meta.get("number"),
+                    "_provider": meta.get("provider"),
+                }
+                versions[recording_id] = version
+            except (OSError, ValueError, TypeError, AttributeError):
+                continue
+        songs.update({recording_id: {key: value for key, value in song.items() if key != "_provider"}
+                      for recording_id, song in cached.items()
+                      if song.get("_provider") != "local" or active_local is None or recording_id in active_local})
+        published_ids = set(known)
+    folders = [] if catalog is not None and catalog.share_root else [
+        path.parent for path in CACHE.glob("*/meta.json")
+        if path.parent.name not in published_ids and stems.prepared(path.parent)
+    ]
+    for folder in folders:
+        meta_path = folder / "meta.json"
         try:
             meta = json.loads(meta_path.read_text(encoding="utf-8"))
             prepared = meta_path.stat().st_mtime
@@ -417,13 +595,20 @@ async def songbook_list():
 
 @app.get("/api/ambient")
 async def ambient():
-    """Cached music videos the TV loops, muted, behind an empty stage: only songs that were prepared,
+    """Published music videos the TV loops, muted, behind an empty stage: only songs that were prepared,
     so a video left behind by a failed download never shows up between songs."""
-    return sorted(path.parent.name for path in CACHE.glob("*/video.mp4") if RECORDING_ID.fullmatch(path.parent.name) and stems.prepared(path.parent))
+    videos = {video_id for video_id in prepared_songs()
+              if (folder := completed_folder(video_id)) and (folder / "video.mp4").is_file()}
+    if catalog is None or not catalog.share_root:
+        videos.update(path.parent.name for path in CACHE.glob("*/video.mp4")
+                      if RECORDING_ID.fullmatch(path.parent.name) and stems.prepared(path.parent))
+    return sorted(videos)
 
 def song_meta(video_id: str) -> tuple[Path, dict]:
-    folder = CACHE / video_id
-    if not RECORDING_ID.fullmatch(video_id) or not (folder / "meta.json").is_file():
+    folder = completed_folder(video_id) if RECORDING_ID.fullmatch(video_id) else None
+    if folder is None and RECORDING_ID.fullmatch(video_id) and (CACHE / video_id / "meta.json").is_file():
+        folder = CACHE / video_id
+    if folder is None or not (folder / "meta.json").is_file():
         raise HTTPException(404, "Song not found")
     meta = json.loads((folder / "meta.json").read_text(encoding="utf-8"))
     if not meta.get("artist") or not meta.get("title") or not meta.get("duration"):
@@ -479,50 +664,76 @@ async def choose_lyrics(video_id: str, choice: LyricChoice):
         raise lrclib_failed(exc) from exc
     if not chosen or not lyrics.STAMP.search(chosen.get("syncedLyrics") or ""):
         raise HTTPException(404, "That lyrics version is no longer available")
-    if state.current and state.current["id"] == video_id:
-        # The song on stage switches right away: time the new lines, then resend lyrics to the TV.
-        lines = lyrics.parse_lrc(chosen["syncedLyrics"])
-        lines = await asyncio.to_thread(worker.timed_lyrics, folder, chosen["syncedLyrics"], stems.path(folder, "vocals"), lines,
-                                        library=catalog)
-        lyrics.line_starts(lines)
+    async with song_edit_lock(video_id):
+        # Re-resolve after the network lookup in case another edit published and removed its working folder.
+        folder, meta = song_meta(video_id)
+        if folder != CACHE / video_id:
+            try:
+                folder = await asyncio.to_thread(working_folder, video_id)
+                meta = songbook.read(folder / "meta.json") or meta
+            except Exception as exc:
+                raise HTTPException(503, f"Could not stage the published package: {exc}") from exc
         if state.current and state.current["id"] == video_id:
-            state.current.update(lyrics=lines, lyrics_rev=state.current.get("lyrics_rev", 0) + 1)
-            state.offset = 0
-            state.lyrics_sent.clear()
-            await state.broadcast()
-    (folder / "lyrics.lrc").write_text(chosen["syncedLyrics"], encoding="utf-8")
-    meta["lyrics_identity"] = [meta["artist"], meta["title"]]
-    meta.pop("lyric_offset", None)  # a nudge for other lyrics no longer fits
-    worker.save_meta(folder, meta)
-    if catalog is not None and stems.prepared(folder):
-        if not catalog.share_root:
-            error = "Windows share is unavailable; the updated package was not published"
-            await asyncio.to_thread(catalog.publication_failed, video_id, error)
-            raise HTTPException(503, error)
-        try:
-            await asyncio.to_thread(exports.publish, folder, catalog.share_root)
-            await asyncio.to_thread(catalog.publication_succeeded, video_id)
-        except Exception as exc:
-            await asyncio.to_thread(catalog.publication_failed, video_id, str(exc))
-            raise HTTPException(502, f"Could not publish the updated package: {exc}") from exc
-    return {"saved": choice.id}
+            # The song on stage switches right away: time the new lines, then resend lyrics to the TV.
+            lines = lyrics.parse_lrc(chosen["syncedLyrics"])
+            lines = await asyncio.to_thread(worker.timed_lyrics, folder, chosen["syncedLyrics"], stems.path(folder, "vocals"), lines,
+                                            library=catalog)
+            lyrics.line_starts(lines)
+            if state.current and state.current["id"] == video_id:
+                state.current.update(lyrics=lines, lyrics_rev=state.current.get("lyrics_rev", 0) + 1)
+                state.offset = 0
+                state.lyrics_sent.clear()
+                await state.broadcast()
+        (folder / "lyrics.lrc").write_text(chosen["syncedLyrics"], encoding="utf-8")
+        meta["lyrics_identity"] = [meta["artist"], meta["title"]]
+        meta.pop("lyric_offset", None)  # a nudge for other lyrics no longer fits
+        worker.save_meta(folder, meta)
+        publication = None
+        if catalog is not None and stems.prepared(folder):
+            if not catalog.share_root:
+                error = "Windows share is unavailable; the updated package was not published"
+                await asyncio.to_thread(catalog.publication_failed, video_id, error)
+                raise HTTPException(503, error)
+            if state.current and state.current["id"] == video_id:
+                schedule_publication(video_id, update_offset=False)
+                publication = "scheduled"
+            else:
+                try:
+                    await publish_working_folder(video_id, folder)
+                    publication = "published"
+                except Exception as exc:
+                    raise HTTPException(502, f"Could not publish the updated package: {exc}") from exc
+    return {"saved": choice.id, "publication": publication}
 
 @app.delete("/api/songs/{video_id}")
 async def delete_song(video_id: str):
-    """Forget a song and delete its download; queueing it again downloads it fresh."""
-    folder = CACHE / video_id
-    if not RECORDING_ID.fullmatch(video_id) or not (folder.is_dir() or video_id in state.played):
+    """Forget a song and remove its authoritative package from the shared library."""
+    if not RECORDING_ID.fullmatch(video_id):
         raise HTTPException(404, "Song not found")
-    if state.queued(video_id):
-        raise HTTPException(409, "Remove it from the queue first")
-    state.played.pop(video_id, None)
-    if folder.is_symlink():
-        folder.unlink()
-    elif folder.is_dir():
-        await asyncio.to_thread(shutil.rmtree, folder)
-    if catalog is not None:
-        published = await asyncio.to_thread(exports.reconcile, CACHE, catalog.share_root)
-        await asyncio.to_thread(catalog.reconcile, published)
+    if pending := publication_tasks.pop(video_id, None):
+        pending.cancel()
+        await asyncio.gather(pending, return_exceptions=True)
+    async with song_edit_lock(video_id):
+        folder = CACHE / video_id
+        published = bool(catalog and catalog.share_root
+                         and exports.validate_shared(catalog.share_root, video_id, verify_hashes=False))
+        if not (folder.is_dir() or published or video_id in state.played):
+            raise HTTPException(404, "Song not found")
+        if state.queued(video_id):
+            raise HTTPException(409, "Remove it from the queue first")
+        state.played.pop(video_id, None)
+        if published:
+            try:
+                await cancellation_safe_thread(exports.delete, catalog.share_root, video_id)
+            except Exception as exc:
+                raise HTTPException(502, f"Could not delete the shared package: {exc}") from exc
+        if folder.is_symlink():
+            folder.unlink()
+        elif folder.is_dir():
+            await cancellation_safe_thread(shutil.rmtree, folder)
+        if catalog is not None:
+            published = await asyncio.to_thread(exports.reconcile, CACHE, catalog.share_root, False)
+            await asyncio.to_thread(catalog.reconcile, published)
     await state.broadcast()
     return {"deleted": video_id}
 
@@ -543,10 +754,14 @@ async def enqueue_next(song: Song):
 
 @app.get("/media/{video_id}/{filename}")
 async def media(video_id: str, filename: str):
-    """Stems are requested by name (vocals, no_vocals) and served in whichever format is cached."""
+    """Stems are requested by name and served from the authoritative completed package."""
     if not RECORDING_ID.fullmatch(video_id) or filename not in (*stems.NAMES, "video.mp4"):
         raise HTTPException(404)
-    folder = CACHE / video_id
+    folder = completed_folder(video_id)
+    if folder is None and (catalog is None or not catalog.share_root) and (CACHE / video_id).is_dir():
+        folder = CACHE / video_id
+    if folder is None:
+        raise HTTPException(404)
     path = folder / filename if filename == "video.mp4" else stems.path(folder, filename)
     if not path or not path.is_file():
         raise HTTPException(404)

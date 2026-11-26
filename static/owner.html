@@ -58,12 +58,14 @@
         <label class="select-all"><input id="select-all" type="checkbox"> Select visible</label>
       </div>
       <div id="candidates" class="candidate-list" aria-live="polite"></div>
+      <nav id="candidate-pagination" class="pagination" aria-label="Candidate pages" hidden><button id="candidate-prev" class="quiet">Previous</button><span id="candidate-page"></span><button id="candidate-next" class="quiet">Next</button></nav>
       <div id="bulk" class="bulk" hidden><b id="selected-count"></b><button data-review="approved">Approve</button><button data-review="deferred" class="quiet">Defer</button><button data-review="rejected" class="danger">Reject</button><button id="prepare">Prepare approved</button></div>
     </section>
 
     <section class="panel jobs-panel">
-      <div class="section-head"><div><span class="kicker">05 / OUTPUT</span><h2>Preparation jobs</h2></div><button id="refresh-jobs" class="quiet">Refresh</button></div>
+      <div class="section-head"><div><span class="kicker">05 / OUTPUT</span><h2>Preparation jobs</h2></div><div class="job-tools"><button id="pause-jobs" class="quiet">Pause queued</button><button id="resume-jobs" class="quiet">Resume paused</button><button id="refresh-jobs" class="quiet">Refresh</button></div></div>
       <div id="jobs" class="jobs"></div>
+      <nav id="job-pagination" class="pagination" aria-label="Preparation job pages" hidden><button id="job-prev" class="quiet">Previous</button><span id="job-page"></span><button id="job-next" class="quiet">Next</button></nav>
     </section>
   </main>
   <div id="toast" class="toast" role="status" hidden></div>

@@ -99,12 +99,13 @@ class Library:
                     attempts INTEGER NOT NULL DEFAULT 0,
                     error TEXT,
                     renderer_id TEXT,
+                    priority INTEGER NOT NULL DEFAULT 0,
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS jobs_status_created ON preparation_jobs(status, created_at);
                 CREATE UNIQUE INDEX IF NOT EXISTS one_active_job_per_candidate
-                    ON preparation_jobs(candidate_id) WHERE status IN ('queued','running');
+                    ON preparation_jobs(candidate_id) WHERE status IN ('queued','running','paused');
                 CREATE TABLE IF NOT EXISTS renderers (
                     id TEXT PRIMARY KEY,
                     name TEXT NOT NULL,
@@ -123,6 +124,13 @@ class Library:
             for name in ("source_path", "source_hash"):
                 if name not in columns:
                     db.execute(f"ALTER TABLE candidates ADD COLUMN {name} TEXT")
+            job_columns = {row["name"] for row in db.execute("PRAGMA table_info(preparation_jobs)")}
+            if "priority" not in job_columns:
+                db.execute("ALTER TABLE preparation_jobs ADD COLUMN priority INTEGER NOT NULL DEFAULT 0")
+            # The original index did not treat paused work as active.
+            db.execute("DROP INDEX IF EXISTS one_active_job_per_candidate")
+            db.execute("CREATE UNIQUE INDEX one_active_job_per_candidate ON preparation_jobs(candidate_id) "
+                       "WHERE status IN ('queued','running','paused')")
             # A process killed during preparation leaves a retryable job, never a false success.
             now = time.time()
             db.execute("UPDATE preparation_jobs SET status='queued', stage=NULL, progress=NULL, updated_at=? WHERE status='running'", (now,))
@@ -168,7 +176,7 @@ class Library:
         key = hashlib.sha256(identity.encode()).hexdigest()
         known = db.execute("SELECT id, source_hash FROM candidates WHERE import_key=?", (key,)).fetchone()
         if known and source_hash and known["source_hash"] != source_hash and db.execute(
-                "SELECT 1 FROM preparation_jobs WHERE candidate_id=? AND status IN ('queued','running')", (known["id"],)).fetchone():
+                "SELECT 1 FROM preparation_jobs WHERE candidate_id=? AND status IN ('queued','running','paused')", (known["id"],)).fetchone():
             raise ValueError(f"Wait for active preparation before replacing {artist} - {title}")
         db.execute("""
             INSERT INTO candidates(import_key, provider, external_id, source_path, source_hash, artist, title, language, created_at, updated_at)
@@ -301,17 +309,33 @@ class Library:
         return {"imported": imported, "existing": existing, "skipped": skipped, "invalid": invalid,
                 "root": str(self.import_root)}
 
-    def candidates(self, status: str | None = None) -> list[dict]:
+    def candidates(self, status: str | None = None, limit: int | None = None, offset: int = 0) -> list[dict]:
         if status is not None and status not in REVIEW_STATUSES:
             raise ValueError("Unknown review status")
+        if limit is not None and limit < 1 or offset < 0:
+            raise ValueError("Invalid candidate page")
         query = "SELECT * FROM candidates"
+        params = []
+        if status:
+            query += " WHERE review_status=?"
+            params.append(status)
+        query += " ORDER BY updated_at DESC, id DESC"
+        if limit is not None:
+            query += " LIMIT ? OFFSET ?"
+            params.extend((limit, offset))
+        with self._connect() as db:
+            return [dict(row) for row in db.execute(query, params)]
+
+    def candidate_count(self, status: str | None = None) -> int:
+        if status is not None and status not in REVIEW_STATUSES:
+            raise ValueError("Unknown review status")
+        query = "SELECT COUNT(*) FROM candidates"
         params = ()
         if status:
             query += " WHERE review_status=?"
             params = (status,)
-        query += " ORDER BY updated_at DESC, id DESC"
         with self._connect() as db:
-            return [dict(row) for row in db.execute(query, params)]
+            return db.execute(query, params).fetchone()[0]
 
     def active_local_ids(self) -> set[str]:
         with self._connect() as db:
@@ -339,10 +363,10 @@ class Library:
                 raise ValueError("Wait for running preparation to finish before changing its review status")
             db.execute(f"UPDATE candidates SET review_status=?, updated_at=? WHERE id IN ({placeholders})", (status, time.time(), *unique))
             if status != "approved":
-                db.execute(f"UPDATE preparation_jobs SET status='cancelled', stage=NULL, progress=NULL, updated_at=? "
-                           f"WHERE candidate_id IN ({placeholders}) AND status='queued'", (time.time(), *unique))
+                db.execute(f"UPDATE preparation_jobs SET status='cancelled', stage=NULL, progress=NULL, priority=0, updated_at=? "
+                           f"WHERE candidate_id IN ({placeholders}) AND status IN ('queued','paused')", (time.time(), *unique))
                 db.execute(f"UPDATE candidates SET processing_status='cancelled', updated_at=? "
-                           f"WHERE id IN ({placeholders}) AND processing_status='queued'", (time.time(), *unique))
+                           f"WHERE id IN ({placeholders}) AND processing_status IN ('queued','paused')", (time.time(), *unique))
         return found
 
     def enqueue(self, ids: list[int]) -> int:
@@ -375,7 +399,7 @@ class Library:
                     raise KeyError("One or more songs were not found")
                 if candidate["review_status"] != "approved":
                     raise ValueError(f"{candidate['artist']} - {candidate['title']} is not approved")
-                active = db.execute("SELECT id FROM preparation_jobs WHERE candidate_id=? AND status IN ('queued','running')", (candidate_id,)).fetchone()
+                active = db.execute("SELECT id FROM preparation_jobs WHERE candidate_id=? AND status IN ('queued','running','paused')", (candidate_id,)).fetchone()
                 if active or candidate["processing_status"] == "ready":
                     continue
                 try:
@@ -397,18 +421,28 @@ class Library:
                 if ready:
                     if row["processing_status"] != "ready":
                         db.execute("UPDATE candidates SET processing_status='ready', error=NULL, updated_at=? WHERE id=?", (now, row["id"]))
-                    db.execute("UPDATE preparation_jobs SET status='ready', stage=NULL, progress=NULL, error=NULL, updated_at=? "
-                               "WHERE candidate_id=? AND status='queued'", (now, row["id"]))
+                    db.execute("UPDATE preparation_jobs SET status='ready', stage=NULL, progress=NULL, priority=0, error=NULL, updated_at=? "
+                               "WHERE candidate_id=? AND status IN ('queued','paused')", (now, row["id"]))
                 elif not ready and row["processing_status"] == "ready":
                     db.execute("UPDATE candidates SET processing_status='not_started', updated_at=? WHERE id=?", (now, row["id"]))
 
-    def jobs(self, limit: int = 100) -> list[dict]:
+    def jobs(self, limit: int = 100, offset: int = 0) -> list[dict]:
+        if limit < 1 or offset < 0:
+            raise ValueError("Invalid job page")
         with self._connect() as db:
             rows = db.execute("""
-                SELECT j.*, c.artist, c.title, c.external_id, c.provider, c.source_path, c.source_hash FROM preparation_jobs j
-                JOIN candidates c ON c.id=j.candidate_id ORDER BY j.created_at DESC LIMIT ?
-            """, (limit,)).fetchall()
+                SELECT j.*, c.artist, c.title, c.external_id, c.provider, c.source_path, c.source_hash,
+                       c.processing_status AS candidate_status,
+                       EXISTS(SELECT 1 FROM preparation_jobs later WHERE later.candidate_id=j.candidate_id
+                              AND later.id>j.id AND later.status='ready') AS superseded
+                FROM preparation_jobs j
+                JOIN candidates c ON c.id=j.candidate_id ORDER BY j.created_at DESC, j.id DESC LIMIT ? OFFSET ?
+            """, (limit, offset)).fetchall()
         return [dict(row) for row in rows]
+
+    def job_count(self) -> int:
+        with self._connect() as db:
+            return db.execute("SELECT COUNT(*) FROM preparation_jobs").fetchone()[0]
 
     def claim_job(self) -> dict | None:
         now = time.time()
@@ -418,13 +452,14 @@ class Library:
                 SELECT j.*, c.artist, c.title, c.external_id, c.provider, c.source_path, c.source_hash FROM preparation_jobs j
                 JOIN candidates c ON c.id=j.candidate_id
                 WHERE j.status='queued' AND c.review_status='approved' AND c.processing_status!='ready'
-                ORDER BY j.created_at, j.id LIMIT 1
+                ORDER BY j.priority DESC, j.created_at, j.id LIMIT 1
             """).fetchone()
             if not row:
                 return None
             # A job recovered after controller restart reconnects to the renderer it originally claimed.
             renderer_id = row["renderer_id"] or self.selected_renderer_id(db)
-            db.execute("UPDATE preparation_jobs SET status='running', stage='starting', attempts=attempts+1, renderer_id=?, updated_at=? WHERE id=?",
+            db.execute("UPDATE preparation_jobs SET status='running', stage='starting', progress=NULL, priority=0, error=NULL, "
+                       "attempts=attempts+1, renderer_id=?, updated_at=? WHERE id=?",
                        (renderer_id, now, row["id"]))
             db.execute("UPDATE candidates SET processing_status='running', error=NULL, updated_at=? WHERE id=?", (now, row["candidate_id"]))
             claimed = dict(row)
@@ -443,10 +478,108 @@ class Library:
             row = db.execute("SELECT candidate_id FROM preparation_jobs WHERE id=?", (job_id,)).fetchone()
             if not row:
                 return
-            db.execute("UPDATE preparation_jobs SET status=?, stage=NULL, progress=NULL, error=?, updated_at=? WHERE id=?",
+            db.execute("UPDATE preparation_jobs SET status=?, stage=NULL, progress=NULL, priority=0, error=?, updated_at=? WHERE id=?",
                        (status, error, now, job_id))
             db.execute("UPDATE candidates SET processing_status=?, error=?, updated_at=? WHERE id=?",
                        (status, error, now, row["candidate_id"]))
+
+    def defer_job(self, job_id: int, error: str):
+        """Return a claimed job to the queue when its renderer is temporarily unavailable."""
+        now = time.time()
+        with self._connect() as db:
+            row = db.execute("SELECT candidate_id, status FROM preparation_jobs WHERE id=?", (job_id,)).fetchone()
+            if not row or row["status"] != "running":
+                return
+            db.execute("UPDATE preparation_jobs SET status='queued', stage=NULL, progress=NULL, error=?, updated_at=? "
+                       "WHERE id=? AND status='running'", (error, now, job_id))
+            db.execute("UPDATE candidates SET processing_status='queued', error=?, updated_at=? WHERE id=?",
+                       (error, now, row["candidate_id"]))
+
+    def pause_jobs(self, job_id: int | None = None) -> int:
+        """Pause queued work. A running conversion is deliberately allowed to finish."""
+        now = time.time()
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if job_id is not None:
+                job = db.execute("SELECT id, candidate_id, status FROM preparation_jobs WHERE id=?", (job_id,)).fetchone()
+                if not job:
+                    raise KeyError("Preparation job not found")
+                if job["status"] == "running":
+                    raise ValueError("A running preparation cannot be paused safely; let it finish")
+                rows = [job] if job["status"] == "queued" else []
+            else:
+                rows = db.execute("SELECT id, candidate_id FROM preparation_jobs WHERE status='queued'").fetchall()
+            if not rows:
+                return 0
+            ids = [row["id"] for row in rows]
+            candidate_ids = [row["candidate_id"] for row in rows]
+            job_marks = ",".join("?" for _ in ids)
+            candidate_marks = ",".join("?" for _ in candidate_ids)
+            db.execute(f"UPDATE preparation_jobs SET status='paused', stage=NULL, progress=NULL, priority=0, updated_at=? "
+                       f"WHERE id IN ({job_marks}) AND status='queued'", (now, *ids))
+            db.execute(f"UPDATE candidates SET processing_status='paused', updated_at=? "
+                       f"WHERE id IN ({candidate_marks}) AND processing_status='queued'", (now, *candidate_ids))
+            return len(rows)
+
+    def resume_jobs(self, job_id: int | None = None, prioritize: bool = False) -> int:
+        """Resume paused work, optionally placing one job at the front of the queue."""
+        now = time.time()
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if job_id is not None:
+                job = db.execute("SELECT id, candidate_id, status FROM preparation_jobs WHERE id=?", (job_id,)).fetchone()
+                if not job:
+                    raise KeyError("Preparation job not found")
+                allowed = ("queued", "paused") if prioritize else ("paused",)
+                if job["status"] not in allowed:
+                    if job["status"] == "running":
+                        raise ValueError("This preparation is already running")
+                    raise ValueError(f"A {job['status']} preparation cannot be {'started' if prioritize else 'resumed'}")
+                priority = db.execute("SELECT COALESCE(MAX(priority), 0) + 1 FROM preparation_jobs").fetchone()[0] if prioritize else 0
+                db.execute("UPDATE preparation_jobs SET status='queued', priority=?, updated_at=? WHERE id=?",
+                           (priority, now, job_id))
+                db.execute("UPDATE candidates SET processing_status='queued', error=NULL, updated_at=? WHERE id=?",
+                           (now, job["candidate_id"]))
+                return 1
+            rows = db.execute("SELECT id, candidate_id FROM preparation_jobs WHERE status='paused'").fetchall()
+            if not rows:
+                return 0
+            ids = [row["id"] for row in rows]
+            candidate_ids = [row["candidate_id"] for row in rows]
+            job_marks = ",".join("?" for _ in ids)
+            candidate_marks = ",".join("?" for _ in candidate_ids)
+            db.execute(f"UPDATE preparation_jobs SET status='queued', priority=0, updated_at=? WHERE id IN ({job_marks})",
+                       (now, *ids))
+            db.execute(f"UPDATE candidates SET processing_status='queued', error=NULL, updated_at=? "
+                       f"WHERE id IN ({candidate_marks})", (now, *candidate_ids))
+            return len(rows)
+
+    def retry_job(self, job_id: int) -> int:
+        """Retry a failed job in place so its attempt history remains visible."""
+        now = time.time()
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            job = db.execute("SELECT j.candidate_id, j.status, c.review_status, c.processing_status, "
+                             "EXISTS(SELECT 1 FROM preparation_jobs later WHERE later.candidate_id=j.candidate_id "
+                             "AND later.id>j.id AND later.status='ready') AS superseded FROM preparation_jobs j "
+                             "JOIN candidates c ON c.id=j.candidate_id WHERE j.id=?", (job_id,)).fetchone()
+            if not job:
+                raise KeyError("Preparation job not found")
+            if job["status"] != "failed":
+                raise ValueError(f"A {job['status']} preparation cannot be retried")
+            if job["processing_status"] == "ready" or job["superseded"]:
+                raise ValueError("This song is already prepared")
+            if job["review_status"] != "approved":
+                raise ValueError("Approve this song before retrying it")
+            if db.execute("SELECT 1 FROM preparation_jobs WHERE candidate_id=? AND id!=? "
+                          "AND status IN ('queued','running','paused')", (job["candidate_id"], job_id)).fetchone():
+                raise ValueError("This song already has an active preparation")
+            priority = db.execute("SELECT COALESCE(MAX(priority), 0) + 1 FROM preparation_jobs").fetchone()[0]
+            db.execute("UPDATE preparation_jobs SET status='queued', stage=NULL, progress=NULL, priority=?, error=NULL, updated_at=? "
+                       "WHERE id=?", (priority, now, job_id))
+            db.execute("UPDATE candidates SET processing_status='queued', error=NULL, updated_at=? WHERE id=?",
+                       (now, job["candidate_id"]))
+            return 1
 
     def publication_failed(self, recording_id: str, error: str):
         """Make a previously ready candidate retryable when its shared package becomes stale."""
@@ -464,8 +597,8 @@ class Library:
                               (recording_id,)).fetchall()
             for row in rows:
                 db.execute("UPDATE candidates SET processing_status='ready', error=NULL, updated_at=? WHERE id=?", (now, row["id"]))
-                db.execute("UPDATE preparation_jobs SET status='ready', stage=NULL, progress=NULL, error=NULL, updated_at=? "
-                           "WHERE candidate_id=? AND status='queued'", (now, row["id"]))
+                db.execute("UPDATE preparation_jobs SET status='ready', stage=NULL, progress=NULL, priority=0, error=NULL, updated_at=? "
+                           "WHERE candidate_id=? AND status IN ('queued','paused')", (now, row["id"]))
 
     @staticmethod
     def selected_renderer_id(db) -> str:
@@ -531,7 +664,7 @@ class Library:
             raise ValueError("The local renderer cannot be deleted")
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            if db.execute("SELECT 1 FROM preparation_jobs WHERE renderer_id=? AND status IN ('queued','running')", (renderer_id,)).fetchone():
+            if db.execute("SELECT 1 FROM preparation_jobs WHERE renderer_id=? AND status IN ('queued','running','paused')", (renderer_id,)).fetchone():
                 raise ValueError("Wait for this renderer's claimed job to finish")
             if self.selected_renderer_id(db) == renderer_id:
                 raise ValueError("Select another renderer before deleting this one")

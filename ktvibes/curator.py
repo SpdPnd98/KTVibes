@@ -3,7 +3,7 @@ import asyncio
 import logging
 from contextlib import suppress
 from .queue import State
-from . import worker
+from . import renderers, worker
 
 
 ACTIVE = {"queued", "downloading", "separating", "syncing", "publishing"}
@@ -30,6 +30,21 @@ async def run(state, cache, library):
             continue
         if not job:
             await asyncio.sleep(1)
+            continue
+        try:
+            renderer = await asyncio.to_thread(library.renderer, job["renderer_id"])
+            if renderer["id"] != "local":
+                await asyncio.to_thread(renderers.health, renderer)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            error = f"Renderer unavailable: {exc}"
+            log.warning("Deferring curated job %s: %s", job["id"], error)
+            try:
+                await asyncio.to_thread(library.defer_job, job["id"], error)
+            except Exception:
+                log.exception("Could not defer curated job %s", job["id"])
+            await asyncio.sleep(30)
             continue
         preparation = None
         try:

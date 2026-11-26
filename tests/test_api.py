@@ -3,6 +3,7 @@ import asyncio
 import importlib.util
 import json
 from pathlib import Path
+import shutil
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
@@ -129,6 +130,26 @@ class APITests(unittest.TestCase):
         self.assertEqual((queued.status_code, queued.json()['queued']), (201, 1))
         jobs = self.client.get('/api/owner/jobs').json()
         self.assertEqual((jobs[0]['status'], jobs[0]['external_id']), ('queued', 'abcdefghijk'))
+        paged = self.client.get('/api/owner/jobs', params={'page': 1, 'page_size': 1}).json()
+        self.assertEqual((paged['total'], paged['page'], paged['pages'], len(paged['items'])), (1, 1, 1, 1))
+
+    def test_owner_can_pause_prioritize_and_retry_jobs(self):
+        csv = 'artist,title,language,source_id\nIU,Good Day,ko,abcdefghijk\n'
+        self.client.post('/api/owner/import', json={'content': csv})
+        candidate = self.client.get('/api/owner/candidates').json()[0]
+        self.client.post('/api/owner/candidates/review', json={'ids': [candidate['id']], 'status': 'approved'})
+        self.client.post('/api/owner/jobs', json={'ids': [candidate['id']]})
+        job = self.client.get('/api/owner/jobs').json()[0]
+        paused = self.client.post('/api/owner/jobs/control', json={'action': 'pause', 'id': job['id']})
+        self.assertEqual((paused.status_code, paused.json()['changed']), (200, 1))
+        self.assertEqual(self.client.get('/api/owner/jobs').json()[0]['status'], 'paused')
+        started = self.client.post('/api/owner/jobs/control', json={'action': 'start', 'id': job['id']})
+        self.assertEqual((started.status_code, started.json()['changed']), (200, 1))
+        claimed = self.main.catalog.claim_job()
+        self.main.catalog.finish_job(claimed['id'], False, 'failed')
+        retried = self.client.post('/api/owner/jobs/control', json={'action': 'retry', 'id': job['id']})
+        self.assertEqual((retried.status_code, retried.json()['changed']), (200, 1))
+        self.assertEqual(self.client.get('/api/owner/jobs').json()[0]['status'], 'queued')
 
     def test_owner_renderer_requires_private_literal_ip(self):
         bad = self.client.post('/api/owner/renderers', json={'name': 'Bad', 'url': 'http://example.com:8790'})
@@ -155,6 +176,8 @@ class APITests(unittest.TestCase):
         self.assertEqual((response.status_code, response.json()['result']['imported']), (200, 2))
         self.assertEqual(search.call_count, 4)
         self.assertEqual(len(self.client.get('/api/owner/candidates', params={'status': 'pending'}).json()), 2)
+        paged = self.client.get('/api/owner/candidates', params={'status': 'pending', 'page': 2, 'page_size': 1}).json()
+        self.assertEqual((paged['total'], paged['page'], paged['pages'], len(paged['items'])), (2, 2, 2, 1))
 
     def test_owner_token_protects_owner_apis(self):
         with patch.dict('os.environ', {'KTVIBES_OWNER_TOKEN': 'secret'}):
@@ -356,6 +379,56 @@ class APITests(unittest.TestCase):
         (folder / 'vocals.opus').write_bytes(b'OggS')
         self.assertEqual(self.client.get('/media/abcdefghijk/vocals').headers['content-type'], 'audio/ogg')
         self.assertEqual(self.client.get('/media/abcdefghijk/vocals.flac').status_code, 404)
+
+    def test_catalog_and_media_use_share_without_local_song_cache(self):
+        from ktvibes import exports
+        cache = Path(self.temp.name)
+        share = cache / 'share'
+        share.mkdir()
+        folder = cache / 'abcdefghijk'
+        folder.mkdir()
+        (folder / 'audio.m4a').write_bytes(b'audio')
+        (folder / 'vocals.opus').write_bytes(b'vocals')
+        (folder / 'no_vocals.opus').write_bytes(b'music')
+        (folder / 'video.mp4').write_bytes(b'0123456789')
+        (folder / 'meta.json').write_text(json.dumps({
+            'artist': 'Ado', 'title': 'Show', 'duration': 10, 'number': 10001,
+            'stem_gain': 1, 'provider': 'youtube',
+        }), encoding='utf-8')
+        with patch.object(exports, 'REQUIRED_ROOT', share), \
+             patch.object(exports.os.path, 'ismount', side_effect=lambda path: Path(path) == share):
+            exports.publish(folder, share)
+            shutil.rmtree(folder)
+            self.main.catalog.share_root = share
+            self.main.state.songbook_roots = [share / 'imported']
+            songs = self.client.get('/api/songbook').json()
+            self.assertEqual([(song['number'], song['id']) for song in songs], [(10001, 'abcdefghijk')])
+            with patch.object(exports, 'published', side_effect=AssertionError('request rescanned the share')):
+                self.assertEqual(self.client.get('/api/songbook').status_code, 200)
+            self.assertEqual(self.client.get('/api/ambient').json(), ['abcdefghijk'])
+            response = self.client.get('/media/abcdefghijk/video.mp4', headers={'Range': 'bytes=2-5'})
+            self.assertEqual((response.status_code, response.content), (206, b'2345'))
+            self.assertFalse(folder.exists())
+        self.main.catalog.share_root = None
+        self.main.state.songbook_roots = []
+
+    def test_unpublished_local_package_is_hidden_when_share_output_is_configured(self):
+        cache = Path(self.temp.name)
+        folder = cache / 'abcdefghijk'
+        folder.mkdir()
+        (folder / 'meta.json').write_text(json.dumps({
+            'artist': 'Ado', 'title': 'Unpublished', 'duration': 10, 'number': 10001, 'provider': 'youtube',
+        }), encoding='utf-8')
+        (folder / 'vocals.opus').write_bytes(b'vocals')
+        (folder / 'no_vocals.opus').write_bytes(b'music')
+        (folder / 'video.mp4').write_bytes(b'video')
+        self.main.catalog.share_root = cache / 'configured-share'
+        try:
+            self.assertEqual(self.client.get('/api/songbook').json(), [])
+            self.assertEqual(self.client.get('/api/ambient').json(), [])
+            self.assertEqual(self.client.get('/media/abcdefghijk/video.mp4').status_code, 404)
+        finally:
+            self.main.catalog.share_root = None
 
     def test_websocket_controls(self):
         with self.client.websocket_connect('/ws?role=tv') as tv:

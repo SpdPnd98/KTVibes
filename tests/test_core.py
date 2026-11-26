@@ -38,6 +38,73 @@ class YouTubeErrorTests(unittest.TestCase):
         self.assertEqual(youtube.explain(Exception('HTTP Error 404')), 'HTTP Error 404')
         with unittest.mock.patch.dict('os.environ', {'KTVIBES_COOKIES_FROM_BROWSER': 'firefox'}):
             self.assertEqual(youtube.base_options()['cookiesfrombrowser'], ('firefox',))
+        with unittest.mock.patch.object(youtube, 'node_path', return_value='/opt/node22'):
+            self.assertEqual(youtube.base_options()['js_runtimes'], {'node': {'path': '/opt/node22'}})
+
+class CuratorTests(unittest.IsolatedAsyncioTestCase):
+    async def test_unavailable_renderer_is_deferred_before_preparation(self):
+        from ktvibes import curator
+        state = unittest.mock.Mock(upcoming=[])
+        library = unittest.mock.Mock()
+        library.claim_job.return_value = {"id": 7, "renderer_id": "gpu"}
+        library.renderer.return_value = {"id": "gpu", "url": "http://192.168.1.42:8790"}
+        with unittest.mock.patch.object(curator.renderers, "health", side_effect=RuntimeError("HTTP 403")), \
+             unittest.mock.patch.object(curator.worker, "prepare") as prepare, \
+             unittest.mock.patch.object(curator.asyncio, "sleep", new=unittest.mock.AsyncMock(side_effect=asyncio.CancelledError)):
+            with self.assertRaises(asyncio.CancelledError):
+                await curator.run(state, Path("cache"), library)
+        prepare.assert_not_called()
+        library.defer_job.assert_called_once_with(7, "Renderer unavailable: HTTP 403")
+
+class MetadataPublicationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_active_package_waits_until_playback_releases_it(self):
+        from ktvibes import main
+        catalog = unittest.mock.Mock(share_root=Path("/share"))
+        state = State()
+        state.current = {"id": "abcdefghijk"}
+        published = unittest.mock.Mock(return_value={})
+        async def release(_delay):
+            published.assert_not_called()
+            state.current = None
+        with unittest.mock.patch.object(main, "catalog", catalog), \
+                unittest.mock.patch.object(main, "state", state), \
+                unittest.mock.patch.object(main.worker, "publish_lock", return_value=asyncio.Lock()), \
+                unittest.mock.patch.object(main.exports, "publish", published), \
+                unittest.mock.patch.object(main, "discard_completed_cache"), \
+                unittest.mock.patch.object(main.asyncio, "sleep", new=release):
+            await main.publish_working_folder("abcdefghijk", Path("/cache/abcdefghijk"), wait_for_playback=True)
+        published.assert_called_once()
+        catalog.publication_succeeded.assert_called_once_with("abcdefghijk")
+
+    async def test_permission_error_is_retried_before_recording_failure(self):
+        from ktvibes import main
+        catalog = unittest.mock.Mock(share_root=Path("/share"))
+        published = unittest.mock.Mock(side_effect=[PermissionError("busy"), {}])
+        with unittest.mock.patch.object(main, "catalog", catalog), \
+                unittest.mock.patch.object(main.worker, "publish_lock", return_value=asyncio.Lock()), \
+                unittest.mock.patch.object(main.exports, "publish", published), \
+                unittest.mock.patch.object(main, "discard_completed_cache"), \
+                unittest.mock.patch.object(main.asyncio, "sleep", new=unittest.mock.AsyncMock()):
+            await main.publish_working_folder("abcdefghijk", Path("/cache/abcdefghijk"))
+        self.assertEqual(published.call_count, 2)
+        catalog.publication_failed.assert_not_called()
+        catalog.publication_succeeded.assert_called_once_with("abcdefghijk")
+
+    async def test_delete_cancels_pending_publication_before_removing_song(self):
+        from ktvibes import main
+        with tempfile.TemporaryDirectory() as temp:
+            state = State()
+            state.played["abcdefghijk"] = 1
+            catalog = unittest.mock.Mock(share_root=None)
+            pending = asyncio.create_task(asyncio.sleep(60))
+            main.publication_tasks["abcdefghijk"] = pending
+            with unittest.mock.patch.object(main, "CACHE", Path(temp)), \
+                    unittest.mock.patch.object(main, "state", state), \
+                    unittest.mock.patch.object(main, "catalog", catalog):
+                result = await main.delete_song("abcdefghijk")
+            self.assertEqual(result, {"deleted": "abcdefghijk"})
+            self.assertTrue(pending.cancelled())
+            self.assertNotIn("abcdefghijk", main.publication_tasks)
 
 class MusicFilterTests(unittest.TestCase):
     def test_keeps_songs_and_drops_other_videos(self):
@@ -472,6 +539,63 @@ class WorkerRunTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(item['status'], 'error')
         self.assertIn('Windows share is unavailable', item['error'])
         publish.assert_not_called()
+
+    async def test_partial_lyric_result_is_published_without_being_marked_final(self):
+        import tempfile
+        from pathlib import Path
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock, Mock, patch
+        from ktvibes import worker
+        state = Mock(broadcast=AsyncMock())
+        library = Mock(share_root=Path('/share'))
+        library.selected_renderer.return_value = {'id': 'local'}
+        raw = '[00:00.10]temporary match'
+        async def partial(*args):
+            return {'raw': raw, 'lines': parse_lrc(raw), 'partial': True}
+        with tempfile.TemporaryDirectory() as temp:
+            cache = Path(temp)
+            folder = cache / 'aaaaaaaaaaa'
+            folder.mkdir()
+            for name in worker.stems.NAMES:
+                (folder / f'{name}.opus').write_bytes(b'stem')
+            item = State.entry('aaaaaaaaaaa', 'A', 'Song')
+            with patch.object(worker, 'fetch_video', return_value=None), \
+                    patch.object(worker.sf, 'info', return_value=SimpleNamespace(duration=100)), \
+                    patch.object(worker.lyrics, 'fetch', partial), \
+                    patch.object(worker, 'timed_lyrics', side_effect=lambda folder, raw, vocals, lines, *args, **kwargs: lines), \
+                    patch.object(worker.exports, 'publish'), patch.object(worker, 'keep_local_cache', return_value=True):
+                await worker.prepare(state, item, cache, library=library, promote=False)
+            meta = json.loads((folder / 'meta.json').read_text(encoding='utf-8'))
+            self.assertEqual((folder / 'lyrics.lrc').read_text(encoding='utf-8'), raw)
+            self.assertNotIn('lyrics_identity', meta)
+            self.assertEqual(item['status'], 'ready')
+
+    async def test_curated_job_fails_retryably_on_transient_lyric_error(self):
+        import tempfile
+        from pathlib import Path
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock, Mock, patch
+        from ktvibes import worker
+        state = Mock(broadcast=AsyncMock())
+        library = Mock(share_root=Path('/share'))
+        library.selected_renderer.return_value = {'id': 'local'}
+        async def unavailable(*args):
+            raise RuntimeError('LRCLIB unavailable')
+        with tempfile.TemporaryDirectory() as temp:
+            cache = Path(temp)
+            folder = cache / 'aaaaaaaaaaa'
+            folder.mkdir()
+            for name in worker.stems.NAMES:
+                (folder / f'{name}.opus').write_bytes(b'stem')
+            item = State.entry('aaaaaaaaaaa', 'A', 'Song')
+            with patch.object(worker, 'fetch_video', return_value=None), \
+                    patch.object(worker.sf, 'info', return_value=SimpleNamespace(duration=100)), \
+                    patch.object(worker.lyrics, 'fetch', unavailable), \
+                    patch.object(worker.exports, 'publish') as publish:
+                await worker.prepare(state, item, cache, library=library, promote=False)
+            self.assertEqual(item['status'], 'error')
+            self.assertIn('retry this preparation', item['error'])
+            publish.assert_not_called()
 
     async def test_removed_song_stops_holding_up_the_queue(self):
         import tempfile, threading

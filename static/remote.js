@@ -430,10 +430,10 @@ function markRow(row){
 function songSheet(song,queue){
  const action=menuSheet(song);
  action('next','Play next',()=>queue('/api/queue/next'));
- // Only a prepared song has lyrics to swap and a download to delete.
+ // Only a prepared song has lyrics to swap and a shared-library package to delete.
  if(song.prepared||song.cached){
   action('lyrics','Wrong lyrics or language',()=>pickLyrics(song));
-  action('remove','Delete download',async()=>{
+   action('remove','Delete from library',async()=>{
    try{await api(`/api/songs/${song.id}`,{method:'DELETE'});toast(`Deleted ${song.title}`);library=library.filter(s=>s.id!==song.id);libraryRows.get(song.id)?.remove();libraryRows.delete(song.id);refreshSongs();}
    catch(error){toast(error.message,undefined,'err');}
   },{dim:true});
@@ -586,7 +586,7 @@ function flyToQueue(source){
  outer.animate([{transform:'none'},{transform:`translateX(${dx}px)`}],{duration:650,easing:'cubic-bezier(.3,0,.7,1)',fill:'forwards'});
  inner.animate([{transform:'none',borderRadius:'8px'},{transform:`translateY(${dy}px) scale(.25) rotate(25deg)`,borderRadius:'50%'}],{duration:650,easing:dy>0?'cubic-bezier(.55,-0.5,.9,.5)':'cubic-bezier(.1,.5,.45,1.4)',fill:'forwards'}).onfinish=()=>outer.remove();
 }
-// Recent songs swipe left to reveal Delete; tapping it deletes the download.
+// Recent songs swipe left to reveal Delete; tapping it removes the shared-library package.
 const REVEAL=96;let openSwipe=null;
 function closeSwipe(){if(!openSwipe)return;openSwipe.classList.remove('open');openSwipe.querySelector('.result').style.transform='';openSwipe=null;}
 document.addEventListener('pointerdown',e=>{if(openSwipe&&!openSwipe.contains(e.target))closeSwipe();});
@@ -666,14 +666,14 @@ function songMenu(wrap,song,del){
  const menu=el('div',undefined,'song-menu'),refetch=el('button'),remove=el('button',undefined,'danger'),label=el('div',undefined,'menu-head classic-only');
  if(song.number){const n=el('span',String(song.number),'lcd');n.dataset.ghost='88888';label.append(n);}label.append(song.title);
  refetch.innerHTML='<svg class="classic-only" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 10h16M4 14h10M4 18h7"/></svg>';refetch.append(el('span','가사 고르기','classic-only'),'Lyrics…');
- remove.innerHTML='<svg class="classic-only" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13M10 11v6M14 11v6"/></svg>';remove.append(el('span','다운로드 삭제','classic-only'),'Delete download');
+  remove.innerHTML='<svg class="classic-only" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13M10 11v6M14 11v6"/></svg>';remove.append(el('span','라이브러리 삭제','classic-only'),'Delete from library');
  menu.setAttribute('role','menu');for(const item of [refetch,remove])item.setAttribute('role','menuitem');
  refetch.onclick=()=>{closeMenu();pickLyrics(song);};
  remove.onclick=()=>{closeMenu();del.click();};
  menu.append(label,refetch,remove);wrap.append(menu);openMenu=menu;refetch.focus();
 }
 function swipeable(row,song,next){
- const wrap=el('div',undefined,'swipe'),del=el('button','Delete','swipe-delete'),more=el('button','⋯','song-more');del.setAttribute('aria-label',`Delete ${song.title} from this device`);
+  const wrap=el('div',undefined,'swipe'),del=el('button','Delete','swipe-delete'),more=el('button','⋯','song-more');del.setAttribute('aria-label',`Delete ${song.title} from the library`);
  more.setAttribute('aria-label',`More actions for ${song.title}`);more.setAttribute('aria-haspopup','menu');more.onclick=()=>songMenu(wrap,song,del);
  wrap.append(row,del,...(next?[next]:[]),more);
  let start=null,dx=0,dragging=false;

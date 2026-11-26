@@ -11,25 +11,31 @@ def read(meta_path: Path):
     except (OSError, ValueError):
         return None
 
-def numbers(cache: Path) -> dict[int, str]:
+def numbers(cache: Path, *additional: Path) -> dict[int, str]:
     """Songbook number -> video id, for every song that has one."""
     found = {}
-    for meta_path in cache.glob("*/meta.json"):
-        meta = read(meta_path)
-        if meta and isinstance(meta.get("number"), int):
-            found[meta["number"]] = meta_path.parent.name
+    for root in (*additional, cache):
+        for meta_path in root.glob("*/meta.json"):
+            meta = read(meta_path)
+            if meta and isinstance(meta.get("number"), int):
+                found[meta["number"]] = meta_path.parent.name
     return found
 
-def assign(cache: Path, meta: dict) -> int:
+def assign(cache: Path, meta: dict, *additional: Path) -> int:
     """Give `meta` the next free number unless it already has one; the caller saves it."""
     if not isinstance(meta.get("number"), int):
-        meta["number"] = max(numbers(cache), default=FIRST - 1) + 1
+        meta["number"] = max(numbers(cache, *additional), default=FIRST - 1) + 1
     return meta["number"]
 
-def find(cache: Path, number: int):
+def find(cache: Path, number: int, *additional: Path):
     """(video id, meta) for a songbook number, or None."""
-    video_id = numbers(cache).get(number)
-    return (video_id, read(cache / video_id / "meta.json")) if video_id else None
+    video_id = numbers(cache, *additional).get(number)
+    if not video_id:
+        return None
+    for root in (cache, *additional):
+        if meta := read(root / video_id / "meta.json"):
+            return video_id, meta
+    return None
 
 def backfill(cache: Path, prepared) -> None:
     """Number prepared songs that predate the songbook, oldest first. Their timestamps are kept,

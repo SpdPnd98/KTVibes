@@ -64,6 +64,7 @@ class State:
         self.build = ""  # fingerprint of the web app files; open pages reload when it changes
         self.lyrics_sent = {}  # TV socket -> key of the song whose lyrics it already has
         self.meta_changed = None  # controller callback for republishing persistent song metadata
+        self.songbook_roots = []  # additional completed-package roots used by keypad reservation
 
     def guides(self):
         """Guide modes with something to show for the current song (all of them when idle)."""
@@ -200,10 +201,10 @@ class State:
             temporary = meta_path.with_suffix(".tmp")
             temporary.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
             temporary.replace(meta_path)
-            if self.meta_changed:
-                self.meta_changed(self.current["id"])
         except (OSError, ValueError):
             pass
+        if self.meta_changed:
+            self.meta_changed(self.current["id"])
 
     def take_back(self):
         """Put the last removed song back where it was, while the removal is still recent."""
@@ -269,7 +270,7 @@ class State:
             return
         if action == "reserve":
             wanted = int(number(message.get("number")))
-            found = self.path and songbook.find(self.path.parent, wanted)
+            found = self.path and songbook.find(self.path.parent, wanted, *self.songbook_roots)
             if not found:
                 raise ValueError(f"No song {wanted}")
             video_id, meta = found

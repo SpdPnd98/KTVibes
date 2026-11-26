@@ -1,6 +1,7 @@
 import hashlib
 import json
 from pathlib import Path
+import shutil
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -51,6 +52,56 @@ class SharedExportTests(unittest.TestCase):
         self.assertFalse((self.share / "failed" / "abcdefghijk.json").exists())
         self.assertEqual(list((self.share / "imported").glob(".*.old")), [])
 
+    def test_metadata_republish_keeps_media_and_package_directory_in_place(self):
+        exports.publish(self.folder, self.share)
+        package = self.share / "imported" / "abcdefghijk"
+        package_inode = package.stat().st_ino
+        audio_inode = (package / "audio.m4a").stat().st_ino
+        (self.folder / "lyrics.lrc").write_text("[00:01.00]Show", encoding="utf-8")
+        meta = json.loads((self.folder / "meta.json").read_text(encoding="utf-8"))
+        meta["lyric_offset"] = 0.25
+        (self.folder / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+        exports.publish(self.folder, self.share)
+        self.assertEqual((package.stat().st_ino, (package / "audio.m4a").stat().st_ino),
+                         (package_inode, audio_inode))
+        self.assertEqual((package / "lyrics.lrc").read_text(encoding="utf-8"), "[00:01.00]Show")
+        self.assertTrue(exports.validate(self.folder, self.share))
+
+    def test_metadata_copy_failure_preserves_every_authoritative_file(self):
+        (self.folder / "lyrics.lrc").write_text("[00:01.00]Original", encoding="utf-8")
+        exports.publish(self.folder, self.share)
+        package = self.share / "imported" / "abcdefghijk"
+        original_meta = (package / "meta.json").read_bytes()
+        original_lyrics = (package / "lyrics.lrc").read_bytes()
+        (self.folder / "lyrics.lrc").write_text("[00:01.00]Changed", encoding="utf-8")
+        meta = json.loads((self.folder / "meta.json").read_text(encoding="utf-8"))
+        meta["lyric_offset"] = 1
+        (self.folder / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+        def partial_copy(_source, destination):
+            destination.write_bytes(b"partial")
+            raise PermissionError("busy")
+        with patch.object(exports.shutil, "copy2", side_effect=partial_copy), self.assertRaises(PermissionError):
+            exports.publish(self.folder, self.share)
+        self.assertEqual((package / "meta.json").read_bytes(), original_meta)
+        self.assertEqual((package / "lyrics.lrc").read_bytes(), original_lyrics)
+        self.assertTrue(exports.validate_shared(self.share, "abcdefghijk"))
+        self.assertEqual(list(package.glob(".*.tmp")), [])
+
+    def test_delete_failure_restores_package_and_manifest(self):
+        exports.publish(self.folder, self.share)
+        manifest = self.share / "manifests" / "abcdefghijk.json"
+        unlink = Path.unlink
+        failed = False
+        def fail_manifest(path, *args, **kwargs):
+            nonlocal failed
+            if path == manifest and not failed:
+                failed = True
+                raise PermissionError("busy")
+            return unlink(path, *args, **kwargs)
+        with patch.object(Path, "unlink", fail_manifest), self.assertRaises(PermissionError):
+            exports.delete(self.share, "abcdefghijk")
+        self.assertTrue(exports.validate(self.folder, self.share))
+
     def test_manifest_failure_restores_previous_complete_package(self):
         exports.publish(self.folder, self.share)
         previous_manifest = (self.share / "manifests" / "abcdefghijk.json").read_bytes()
@@ -73,6 +124,18 @@ class SharedExportTests(unittest.TestCase):
         failure = json.loads((self.share / "failed" / "abcdefghijk.json").read_text(encoding="utf-8"))
         self.assertIn("incomplete", failure["error"])
         self.assertFalse((self.share / "imported" / "abcdefghijk").exists())
+
+    def test_incomplete_identity_metadata_is_not_publishable(self):
+        (self.folder / "meta.json").write_text(json.dumps({"stem_gain": 1}), encoding="utf-8")
+        with self.assertRaisesRegex(RuntimeError, "metadata is incomplete"):
+            exports.publish(self.folder, self.share)
+        self.assertFalse((self.share / "imported" / "abcdefghijk").exists())
+
+    def test_shared_validation_rejects_metadata_that_disagrees_with_manifest(self):
+        exports.publish(self.folder, self.share)
+        package_meta = self.share / "imported" / "abcdefghijk" / "meta.json"
+        package_meta.write_text(json.dumps({"artist": "Wrong", "title": "Show", "provider": "youtube"}), encoding="utf-8")
+        self.assertFalse(exports.validate_shared(self.share, "abcdefghijk", verify_hashes=False))
 
     def test_backfill_publishes_existing_prepared_songs(self):
         self.assertEqual(exports.backfill(self.cache, self.share), {"published": 1, "failed": 0})
@@ -98,6 +161,35 @@ class SharedExportTests(unittest.TestCase):
         self.assertFalse(exports.validate(self.folder, self.share))
         self.assertEqual(exports.reconcile(self.cache, self.share), {"abcdefghijk"})
         self.assertFalse((self.share / "imported" / "abcdefghijk" / "stale.wav").exists())
+
+    def test_fast_validation_uses_manifests_without_rereading_shared_bytes(self):
+        exports.publish(self.folder, self.share)
+        shared_audio = self.share / "imported" / "abcdefghijk" / "audio.m4a"
+        original_sha256 = exports._sha256
+        def reject_shared(path):
+            if path == shared_audio:
+                raise AssertionError("startup reread shared artifact bytes")
+            return original_sha256(path)
+        with patch.object(exports, "_sha256", side_effect=reject_shared):
+            self.assertTrue(exports.validate(self.folder, self.share, verify_shared_hashes=False))
+        shared_audio.write_bytes(b"different size")
+        self.assertFalse(exports.validate(self.folder, self.share, verify_shared_hashes=False))
+
+    def test_published_package_is_valid_without_local_cache_and_can_be_staged(self):
+        exports.publish(self.folder, self.share)
+        shutil.rmtree(self.folder)
+        self.assertTrue(exports.validate_shared(self.share, "abcdefghijk"))
+        self.assertEqual(exports.published(self.share), {"abcdefghijk"})
+        exports.stage(self.share, "abcdefghijk", self.folder)
+        self.assertTrue(exports.validate(self.folder, self.share))
+
+    def test_delete_removes_share_only_package_and_manifest(self):
+        exports.publish(self.folder, self.share)
+        shutil.rmtree(self.folder)
+        exports.delete(self.share, "abcdefghijk")
+        self.assertFalse((self.share / "imported" / "abcdefghijk").exists())
+        self.assertFalse((self.share / "manifests" / "abcdefghijk.json").exists())
+        self.assertEqual(exports.published(self.share), set())
 
     def test_unavailable_share_is_not_created(self):
         missing = self.root / "not-mounted"

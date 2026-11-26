@@ -1,5 +1,6 @@
 """YouTube search/download. Run: uv run python -m ktvibes.youtube QUERY"""
 import json
+from functools import cache
 import os
 import re
 import sys
@@ -124,11 +125,31 @@ def explain(error: Exception) -> str:
     """A yt-dlp error in words a host can act on."""
     return BOT_HELP if BOT_CHECK.search(str(error)) else str(error)[-500:]
 
+
+@cache
+def node_path() -> str | None:
+    """Find a Node release new enough for yt-dlp's current YouTube player support."""
+    import shutil
+    candidates = [os.environ.get("KTVIBES_NODE"), shutil.which("node"),
+                  "/opt/homebrew/opt/node@22/bin/node", "/usr/local/opt/node@22/bin/node"]
+    for candidate in dict.fromkeys(path for path in candidates if path):
+        try:
+            result = subprocess.run([candidate, "--version"], check=True, capture_output=True, text=True, timeout=5)
+            match = re.fullmatch(r"v(\d+)(?:\.\d+){2}\s*", result.stdout)
+            if match and int(match[1]) >= 22:
+                return candidate
+        except (OSError, subprocess.SubprocessError):
+            continue
+    return None
+
+
 def base_options() -> dict:
     """yt-dlp options for every request: Node.js for YouTube's player code, and optionally a browser's
     YouTube cookies (KTVIBES_COOKIES_FROM_BROWSER=chrome), which gets past YouTube's bot check."""
     browser = os.environ.get("KTVIBES_COOKIES_FROM_BROWSER")
-    return {"js_runtimes": {"node": {}}, **({"cookiesfrombrowser": (browser,)} if browser else {})}
+    node = node_path()
+    return {"js_runtimes": {"node": {"path": node} if node else {}},
+            **({"cookiesfrombrowser": (browser,)} if browser else {})}
 
 def download_video(video_id: str, directory: Path, progress=None) -> None:
     """Cache browser-compatible H.264 video with no embedded audio; 720p is about half the size of 1080p."""

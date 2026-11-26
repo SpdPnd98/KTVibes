@@ -32,6 +32,18 @@ class LibraryTests(unittest.TestCase):
         again = {item["id"]: item for item in Library(self.path).candidates()}
         self.assertEqual(again[song["id"]]["review_status"], "approved")
 
+    def test_candidates_and_jobs_support_stable_pages(self):
+        self.library.import_csv(CSV)
+        first = self.library.candidates(limit=1)
+        second = self.library.candidates(limit=1, offset=1)
+        self.assertEqual((self.library.candidate_count(), len(first), len(second)), (2, 1, 1))
+        self.assertNotEqual(first[0]["id"], second[0]["id"])
+        for song in self.library.candidates():
+            self.library.review([song["id"]], "approved")
+            self.library.enqueue([song["id"]])
+        self.assertEqual(self.library.job_count(), 2)
+        self.assertGreater(self.library.jobs(limit=1)[0]["id"], self.library.jobs(limit=1, offset=1)[0]["id"])
+
     def test_discovery_import_deduplicates_and_preserves_review_state(self):
         songs = [{"id": "abcdefghijk", "artist": "Ado", "title": "One"},
                  {"id": "abcdefghijk", "artist": "Ado", "title": "Duplicate"},
@@ -92,6 +104,66 @@ class LibraryTests(unittest.TestCase):
         recovered = Library(self.path)
         self.assertEqual(recovered.jobs()[0]["status"], "queued")
         self.assertEqual(recovered.candidates()[0]["processing_status"], "queued")
+
+    def test_unavailable_renderer_defers_running_job(self):
+        self.library.import_csv(CSV)
+        song = self.library.candidates()[0]
+        self.library.review([song["id"]], "approved")
+        self.library.enqueue([song["id"]])
+        job = self.library.claim_job()
+        self.library.defer_job(job["id"], "Renderer unavailable: HTTP 403")
+        deferred = self.library.jobs()[0]
+        self.assertEqual((deferred["status"], deferred["stage"], deferred["error"]),
+                         ("queued", None, "Renderer unavailable: HTTP 403"))
+        self.assertEqual(self.library.candidate(song["id"])["processing_status"], "queued")
+        claimed = self.library.claim_job()
+        self.assertEqual((claimed["id"], self.library.jobs()[0]["error"]), (job["id"], None))
+
+    def test_jobs_can_pause_resume_and_start_next(self):
+        self.library.import_csv(CSV)
+        songs = self.library.candidates()
+        for song in songs:
+            self.library.review([song["id"]], "approved")
+            self.library.enqueue([song["id"]])
+        jobs = {job["candidate_id"]: job for job in self.library.jobs()}
+        first, second = songs
+        self.assertEqual(self.library.pause_jobs(jobs[first["id"]]["id"]), 1)
+        self.assertEqual(self.library.candidate(first["id"])["processing_status"], "paused")
+        self.assertEqual(self.library.enqueue([first["id"]]), 0)
+        self.assertEqual(self.library.resume_jobs(jobs[first["id"]]["id"]), 1)
+        self.assertEqual(self.library.pause_jobs(), 2)
+        self.assertEqual(self.library.resume_jobs(), 2)
+        self.library.resume_jobs(jobs[second["id"]]["id"], prioritize=True)
+        self.assertEqual(self.library.claim_job()["id"], jobs[second["id"]]["id"])
+        with self.assertRaisesRegex(ValueError, "cannot be paused safely"):
+            self.library.pause_jobs(jobs[second["id"]]["id"])
+
+    def test_failed_job_retries_in_place(self):
+        self.library.import_csv(CSV)
+        song = self.library.candidates()[0]
+        self.library.review([song["id"]], "approved")
+        self.library.enqueue([song["id"]])
+        job = self.library.claim_job()
+        self.library.finish_job(job["id"], False, "network failed")
+        self.assertEqual(self.library.retry_job(job["id"]), 1)
+        retried = self.library.claim_job()
+        self.assertEqual((retried["id"], self.library.jobs()[0]["attempts"]), (job["id"], 2))
+
+    def test_historical_failure_cannot_regress_a_ready_candidate(self):
+        self.library.import_csv(CSV)
+        song = self.library.candidates()[0]
+        self.library.review([song["id"]], "approved")
+        self.library.enqueue([song["id"]])
+        failed = self.library.claim_job()
+        self.library.finish_job(failed["id"], False, "first attempt failed")
+        self.library.enqueue([song["id"]])
+        ready = self.library.claim_job()
+        self.library.finish_job(ready["id"], True)
+        with self.assertRaisesRegex(ValueError, "already prepared"):
+            self.library.retry_job(failed["id"])
+        self.library.publication_failed(song["external_id"], "metadata publish failed")
+        with self.assertRaisesRegex(ValueError, "already prepared"):
+            self.library.retry_job(failed["id"])
 
     def test_cache_reconciliation_marks_existing_and_deleted_artifacts(self):
         self.library.import_csv(CSV)
@@ -243,6 +315,20 @@ class PreparationLockTests(unittest.IsolatedAsyncioTestCase):
         item = {"id": "locktest001"}
         with patch.object(worker, "_prepare", fake_prepare):
             await asyncio.gather(worker.prepare(None, item, Path(".")), worker.prepare(None, item, Path(".")))
+        self.assertEqual(maximum, 1)
+
+    async def test_different_recordings_are_also_prepared_one_at_a_time(self):
+        from ktvibes import worker
+        active = maximum = 0
+        async def fake_prepare(*args, **kwargs):
+            nonlocal active, maximum
+            active += 1
+            maximum = max(maximum, active)
+            await asyncio.sleep(0.01)
+            active -= 1
+        with patch.object(worker, "_prepare", fake_prepare):
+            await asyncio.gather(worker.prepare(None, {"id": "locktest002"}, Path(".")),
+                                 worker.prepare(None, {"id": "locktest003"}, Path(".")))
         self.assertEqual(maximum, 1)
 
 

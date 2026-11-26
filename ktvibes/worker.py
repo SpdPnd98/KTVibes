@@ -3,7 +3,9 @@ import hashlib
 import json
 import logging
 import os
+import shutil
 import time
+import weakref
 from pathlib import Path
 import soundfile as sf
 from . import align, exports, guides, renderers, songbook, stems, youtube, lyrics
@@ -139,8 +141,57 @@ class Removed(Exception):
 
 # Video downloads still running, by video id: a song queued again reuses its download instead of starting a second.
 videos = {}
-preparation_locks = {}
-publish_lock = asyncio.Lock()
+preparation_locks = weakref.WeakKeyDictionary()
+preparation_gates = weakref.WeakKeyDictionary()
+publish_locks = weakref.WeakKeyDictionary()
+
+
+def _loop_lock(locks):
+    loop = asyncio.get_running_loop()
+    return locks.setdefault(loop, asyncio.Lock())
+
+
+def publish_lock():
+    return _loop_lock(publish_locks)
+
+
+async def cancellation_safe_thread(function, *args):
+    running = asyncio.create_task(asyncio.to_thread(function, *args))
+    try:
+        return await asyncio.shield(running)
+    except asyncio.CancelledError:
+        await running
+        raise
+
+
+def keep_local_cache() -> bool:
+    return os.environ.get("KTVIBES_KEEP_LOCAL_CACHE", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def load_published(item: dict, folder: Path):
+    """Populate a queue item directly from an authoritative shared package."""
+    meta = songbook.read(folder / "meta.json") or {}
+    instrumental = stems.path(folder, "no_vocals")
+    if not instrumental or not meta.get("artist") or not meta.get("title"):
+        raise RuntimeError("Published package is incomplete")
+    item["artist"], item["title"] = meta["artist"], meta["title"]
+    item["provider"] = meta.get("provider", "youtube")
+    item["thumbnail"] = "/static/local-track.svg" if item["provider"] == "local" else f"https://i.ytimg.com/vi/{item['id']}/mqdefault.jpg"
+    item["video"] = (folder / "video.mp4").is_file()
+    item["duration"] = float(meta.get("duration") or sf.info(instrumental).duration)
+    item["gain"] = float(meta.get("stem_gain") or 1)
+    item["offset"] = float(meta.get("lyric_offset") or 0)
+    item["number"] = meta.get("number")
+    known_end = meta.get("song_end")
+    if isinstance(known_end, list) and len(known_end) == 2 and known_end[1]:
+        item["music_end"] = known_end[1]
+    try:
+        timed = json.loads((folder / "timed.json").read_text(encoding="utf-8"))
+        item["lyrics"] = timed["lines"] if isinstance(timed.get("lines"), list) else []
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        raw = (folder / "lyrics.lrc").read_text(encoding="utf-8") if (folder / "lyrics.lrc").is_file() else ""
+        item["lyrics"] = lyrics.parse_lrc(raw)
+    lyrics.line_starts(item["lyrics"])
 
 def warm_models(library=None):
     """Warm local models only when this machine was explicitly selected as the renderer."""
@@ -165,6 +216,14 @@ async def _prepare(state, item, cache: Path, library=None, promote=True, rendere
         if promote and item is not state.current and item not in state.upcoming:
             raise Removed
     try:
+        shared = library and library.share_root and library.share_root / "imported" / item["id"]
+        if shared and exports.validate_shared(library.share_root, item["id"], verify_hashes=False):
+            await asyncio.to_thread(load_published, item, shared)
+            item["status"], item["step"], item["progress"] = "ready", None, None
+            if promote:
+                state.promote()
+            await state.broadcast()
+            return
         folder.mkdir(parents=True, exist_ok=True)
         meta_path = folder / "meta.json"
         meta = songbook.read(meta_path) or {}
@@ -249,17 +308,19 @@ async def _prepare(state, item, cache: Path, library=None, promote=True, rendere
             try:
                 result = await lyrics.fetch(*identity, item["duration"], (meta.get("source_title") or "",))
                 raw, item["lyrics"] = result["raw"], result["lines"]
+                if result["raw"]:
+                    (folder / "lyrics.lrc").write_text(result["raw"], encoding="utf-8")
                 if not result.get("partial"):
                     # A miss is remembered for a week, so a later LRCLIB addition is still picked up.
                     meta["lyrics_identity"], meta["lyrics_checked"] = identity, time.time()
                     meta.pop("lyric_offset", None)  # a nudge for other lyrics no longer fits
-                    if result["raw"]:
-                        (folder / "lyrics.lrc").write_text(result["raw"], encoding="utf-8")
-                    else:
+                    if not result["raw"]:
                         (folder / "lyrics.lrc").unlink(missing_ok=True)
-            except Exception:
+            except Exception as exc:
                 log.exception("Lyrics unavailable for %s", item["id"])
                 item["lyrics_warning"] = "Lyrics unavailable; audio is ready."
+                if not promote:
+                    raise RuntimeError("Lyrics lookup failed temporarily; retry this preparation") from exc
         if item["lyrics"]:
             item["step"], item["progress"] = "timing", 0.0
             await state.broadcast()
@@ -274,18 +335,25 @@ async def _prepare(state, item, cache: Path, library=None, promote=True, rendere
         item["offset"] = float(meta.get("lyric_offset") or 0)
         meta.update(duration=item["duration"], artist=item["artist"], title=item["title"],
                     provider=item.get("provider", meta.get("provider", "youtube")))
-        # Live and curated songs can finish together; keep number assignment and metadata publication atomic.
-        async with publish_lock:
-            item["number"] = songbook.assign(cache, meta)
-            save_meta(folder, meta)
-        check()
         if library:
             if not library.share_root:
                 raise RuntimeError("Windows share is unavailable; completed packages must be published before they are ready")
             item["status"], item["step"], item["progress"] = "publishing", "share", None
             await state.broadcast()
-            await asyncio.to_thread(exports.publish, folder, library.share_root)
+        # Number assignment and SMB publication are one-at-a-time across preparation and metadata edits.
+        async with publish_lock():
+            shared_songbook = (library.share_root / "imported",) if library and library.share_root else ()
+            item["number"] = songbook.assign(cache, meta, *shared_songbook)
+            save_meta(folder, meta)
             check()
+            if library:
+                await cancellation_safe_thread(exports.publish, folder, library.share_root)
+            check()
+            if library and not keep_local_cache():
+                try:
+                    await cancellation_safe_thread(shutil.rmtree, folder)
+                except OSError:
+                    log.exception("Could not remove completed local cache for %s", item["id"])
         item["status"], item["step"], item["progress"] = "ready", None, None
         if promote:
             state.promote()
@@ -305,10 +373,12 @@ async def _prepare(state, item, cache: Path, library=None, promote=True, rendere
 
 
 async def prepare(state, item, cache: Path, library=None, promote=True, renderer_id=None):
-    """Serialize one recording while allowing unrelated downloads and lyric work to overlap."""
-    lock = preparation_locks.setdefault(item["id"], asyncio.Lock())
-    async with lock:
-        await _prepare(state, item, cache, library, promote, renderer_id)
+    """Prepare only one song at a time; live work is noticed before the curator claims its next job."""
+    async with _loop_lock(preparation_gates):
+        locks = preparation_locks.setdefault(asyncio.get_running_loop(), {})
+        lock = locks.setdefault(item["id"], asyncio.Lock())
+        async with lock:
+            await _prepare(state, item, cache, library, promote, renderer_id)
 
 
 async def run(state, cache: Path, library=None):
